@@ -1,0 +1,30 @@
+# Virtual environment
+venv/
+
+# Data files (too large for git, can be regenerated)
+data/
+
+# Output charts and reports
+outputs/
+
+# API keys - NEVER commit this
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# VSCode settings
+.vscode/
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints/
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Saved ML models (large files)
+models/
