@@ -132,9 +132,6 @@ def create_labels(df: pd.DataFrame) -> pd.DataFrame:
     Label = 1 if tomorrow's close > today's close (price goes up)
     Label = 0 if tomorrow's close <= today's close (price goes down)
 
-    shift(-1) looks one row forward — this is what makes it a prediction target.
-    The last row is dropped since it has no next-day close to compare against.
-
     Design choice: predicting direction (classification) rather than exact price
     (regression) because direction is sufficient for trading decisions and is a
     cleaner, more learnable signal on small datasets.

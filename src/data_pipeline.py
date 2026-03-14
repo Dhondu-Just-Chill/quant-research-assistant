@@ -4,7 +4,7 @@ import yfinance as yf
 import pandas as pd
 import os
 
-def fetch_market_data(ticker: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
+def fetch_market_data(ticker: str, period: str = "3y", interval: str = "1d") -> pd.DataFrame:
     """
     Fetch historical OHLCV data for a given ticker.
     
