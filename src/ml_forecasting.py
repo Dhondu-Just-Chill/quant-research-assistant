@@ -238,7 +238,16 @@ def train_model(X_train, y_train, params: dict) -> XGBClassifier:
     random_state=42 ensures reproducibility — same data always produces
     the same model, which is important for debugging and comparison.
     """
-    model = XGBClassifier(**params, eval_metric="logloss", random_state=42)
+    neg  = (y_train == 0).sum()
+    pos  = (y_train == 1).sum()
+    scale = neg / pos  
+
+    model = XGBClassifier(
+        **params,
+        scale_pos_weight=scale,  # penalizes missing down days more
+        eval_metric="logloss",
+        random_state=42
+    )
     model.fit(X_train, y_train)
     return model
 
