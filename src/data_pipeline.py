@@ -132,7 +132,7 @@ def save_data(df: pd.DataFrame, filename: str) -> None:
 
 
 if __name__ == "__main__":
-    tickers = ["AAPL", "SPY"]
+    tickers = ["AAPL", "SPY", "GOOGL", "AMZN", "MSFT"]
 
     # Fetch and save OHLCV data for each ticker
     for ticker in tickers:
