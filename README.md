@@ -24,15 +24,15 @@ Yahoo Finance (yfinance)
         │
         ├──────────────────────────────────┐
         ▼                                  ▼
-┌───────────────────┐          ┌───────────────────────┐
+┌────────────────────┐          ┌───────────────────────┐
 │statistical_analysis│          │    ml_forecasting     │
-│                   │          │                       │
-│ Sharpe ratio      │          │ Feature engineering   │
-│ VaR               │          │ GridSearch + TSS CV   │
-│ Max drawdown      │          │ XGBoost classifier    │
-│ Kurtosis          │          │ Permutation pruning   │
-│ Jarque-Bera       │          │ Auto feature select   │
-└───────────────────┘          └───────────────────────┘
+│                    │          │                       │
+│ Sharpe ratio       │          │ Feature engineering   │
+│ VaR                │          │ GridSearch + TSS CV   │
+│ Max drawdown       │          │ XGBoost classifier    │
+│ Kurtosis           │          │ Permutation pruning   │
+│ Jarque-Bera        │          │ Auto feature select   │
+└────────────────────┘          └───────────────────────┘
         │                                  │
         └──────────────┬───────────────────┘
                        ▼
