@@ -405,5 +405,5 @@ if __name__ == "__main__":
         print(f"\n{results['ticker']} complete")
         print(f"  Accuracy:  {results['accuracy']}%")
         print(f"  Features:  {results['n_features']}")
-        print(f"  Params:    {results['best_params']}")
+        print(f"  Params:    {results['best_params']}"
         print("---")
