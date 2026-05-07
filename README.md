@@ -37,7 +37,7 @@ Yahoo Finance (yfinance)
         └──────────────┬───────────────────┘
                        ▼
              ┌───────────────────┐
-             │    llm_report     │  (Week 3 — in progress)
+             │    llm_report     │  (Step 3 — in progress)
              │                   │
              │ News sentiment    │
              │ Research report   │
@@ -45,13 +45,13 @@ Yahoo Finance (yfinance)
              └───────────────────┘
                        │
                        ▼
-             ┌───────────────────┐
-             │      app.py       │  (Week 4 — planned)
-             │                   │
-             │ Streamlit UI      │
+             ┌────────────────────┐
+             │      app.py        │  (Step 4 — planned)
+             │                    │
+             │ Streamlit UI       │
              │ Portfolio optimizer│
              │ Efficient frontier │
-             └───────────────────┘
+             └────────────────────┘
 ```
 
 ---
@@ -255,10 +255,10 @@ No other code changes required.
 
 ## Roadmap
 
-- [x] Week 1 — Data pipeline, statistical analysis module
-- [x] Week 2 — ML forecasting with XGBoost, GridSearch, macro features, automatic feature selection
-- [ ] Week 3 — News sentiment analysis, LLM research report generator
-- [ ] Week 4 — Streamlit UI, multi-asset portfolio optimizer, efficient frontier
+- [x] Step 1 — Data pipeline, statistical analysis module
+- [x] Step 2 — ML forecasting with XGBoost, GridSearch, macro features, automatic feature selection
+- [ ] Step 3 — News sentiment analysis, LLM research report generator
+- [ ] Step 4 — Streamlit UI, multi-asset portfolio optimizer, efficient frontier
 
 ### Planned Enhancements (Post v1)
 - Hourly bar feature engineering aggregated to daily predictions
