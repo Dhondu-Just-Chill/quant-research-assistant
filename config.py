@@ -6,7 +6,7 @@
 # To add a new pre-trained ticker:
 #   1. Add to PRETRAINED_TICKERS
 #   2. Add to TRAIN_END if cutoff differs from default
-#   3. Add custom query strings to get_trends_query / get_gdelt_query (optional)
+#   3. Add custom query strings to get_trends_query / get_gdelt_queries (optional)
 #   4. Run data_pipeline.py → ml_forecasting.py for that ticker
 #
 # To retrain a ticker after drift:
@@ -216,13 +216,14 @@ GDELT_MODE        = "timelinetone"  # returns sentiment over time
 
 # Custom GDELT search queries for pre-trained tickers.
 # More specific queries reduce irrelevant article noise.
-_GDELT_QUERIES = {
-    "AAPL":  "Apple Inc stock market",
-    "GOOGL": "Google Alphabet stock market",
-    "AMZN":  "Amazon stock market",
-    "MSFT":  "Microsoft stock market",
-    "SPY":   "S&P 500 index market",
+_GDELT_QUERY_MAP = {
+    "AAPL":  ["Apple stock", "Apple earnings", "Apple shares"],
+    "GOOGL": ["Google stock", "Alphabet earnings", "Google shares"],
+    "AMZN":  ["Amazon stock", "Amazon earnings", "Amazon shares"],
+    "MSFT":  ["Microsoft stock", "Microsoft earnings", "Microsoft shares"],
+    "SPY":   ["S&P 500 index", "SPY ETF", "S&P 500 market"],
 }
+
 
 
 # ── GEMINI SETTINGS ───────────────────────────────────────────────────
@@ -302,14 +303,20 @@ def get_trends_query(ticker: str, company_name: str) -> str:
     return _TRENDS_QUERIES.get(ticker, f"{company_name} stock")
 
 
-def get_gdelt_query(ticker: str, company_name: str) -> str:
+def get_gdelt_queries(ticker: str, company_name: str) -> list[str]:
     """
-    Return GDELT search query for a ticker.
+    Return list of GDELT search queries for a ticker.
 
-    Uses custom query for pre-trained tickers.
-    Falls back to '{company_name} stock market' for unknown tickers.
+    Multiple queries averaged together give broader, more robust
+    sentiment coverage than a single query — reduces risk of empty
+    responses and captures different terminology used across sources.
+
+    Falls back to two generic queries for unknown tickers.
     """
-    return _GDELT_QUERIES.get(ticker, f"{company_name} stock market")
+    return _GDELT_QUERY_MAP.get(ticker, [
+        f"{company_name} stock",
+        f"{company_name} earnings",
+    ])
 
 
 def is_etf(ticker: str) -> bool:

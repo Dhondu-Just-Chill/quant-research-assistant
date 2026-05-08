@@ -51,7 +51,7 @@ from config import (
     data_path,
     get_train_end,
     get_trends_query,
-    get_gdelt_query,
+    get_gdelt_queries,
     is_etf,
 )
 
@@ -256,37 +256,19 @@ def fetch_trends_data(ticker: str, company_name: str) -> pd.DataFrame:
 
 # ── GDELT ─────────────────────────────────────────────────────────────
 
-def fetch_gdelt_timelinetone(ticker: str, company_name: str) -> pd.DataFrame:
+def fetch_single_gdelt_tone(query: str, start_dt: str, end_dt: str) -> pd.Series:
     """
-    Fetch pre-computed sentiment tone from GDELT DOC API timelinetone mode.
+    Fetch GDELT timelinetone for a single query string.
 
-    timelinetone returns average article tone per time bucket across the
-    full query period — no Gemini calls needed. GDELT computes tone using
-    linguistic analysis across thousands of sources simultaneously.
+    Returns a pandas Series indexed by date with tone values,
+    or empty Series on failure. Called once per query by
+    fetch_gdelt_timelinetone() which averages across queries.
 
-    Tone scale: negative values = negative coverage, positive = positive.
-    Typical range is roughly -10 to +10 though extremes can exceed this.
-
-    Makes a single API call per ticker covering the full training window
-    rather than monthly chunks — more reliable than artlist mode which
-    frequently returns empty responses for historical date ranges.
-
-    Derived features:
-        gdelt_tone      : raw daily tone score
-        gdelt_tone_ma7  : 7-day smoothed tone — reduces daily noise
-        gdelt_tone_change: day-over-day tone change — sentiment momentum
-        gdelt_positive   : 1 if tone > 0.5, else 0 — binary positive signal
-        gdelt_negative   : 1 if tone < -0.5, else 0 — binary negative signal
+    Args:
+        query    : GDELT search query string
+        start_dt : start datetime string in YYYYMMDDHHMMSS format
+        end_dt   : end datetime string in YYYYMMDDHHMMSS format
     """
-    query     = get_gdelt_query(ticker, company_name)
-    train_end = get_train_end(ticker)
-
-    # GDELT datetime format: YYYYMMDDHHMMSS
-    start_dt = datetime.strptime(TRAIN_START, "%Y-%m-%d").strftime("%Y%m%d%H%M%S")
-    end_dt   = datetime.strptime(train_end, "%Y-%m-%d").strftime("%Y%m%d%H%M%S")
-
-    print(f"  Fetching GDELT timelinetone for '{query}'...")
-
     params = {
         "query":         query,
         "mode":          "timelinetone",
@@ -299,100 +281,136 @@ def fetch_gdelt_timelinetone(ticker: str, company_name: str) -> pd.DataFrame:
         response = requests.get(GDELT_API_URL, params=params, timeout=30)
 
         if not response.text.strip():
-            print(f"  GDELT returned empty response for {ticker}")
-            return pd.DataFrame()
+            print(f"    Empty response for query: '{query}'")
+            return pd.Series(dtype=float)
 
         data     = response.json()
         timeline = data.get("timeline", [])
 
         if not timeline:
-            print(f"  No timeline data returned for {ticker}")
-            return pd.DataFrame()
+            print(f"    No timeline data for query: '{query}'")
+            return pd.Series(dtype=float)
 
-        # Each entry in timeline has a list of data points
-        # Structure: [{"series": [{"date": "...", "value": tone}, ...]}]
         records = []
         for series in timeline:
             for point in series.get("data", []):
                 raw_date = point.get("date", "")
                 tone     = point.get("value", 0.0)
-
                 try:
-                    # GDELT date format varies — handle both YYYYMMDDTHHMMSSZ and YYYY-MM-DD
                     if "T" in raw_date:
                         date = datetime.strptime(raw_date[:8], "%Y%m%d").strftime("%Y-%m-%d")
                     else:
                         date = raw_date[:10]
-                    records.append({"date": date, "gdelt_tone": float(tone)})
+                    records.append({"date": date, "tone": float(tone)})
                 except Exception:
                     continue
 
         if not records:
-            print(f"  Could not parse GDELT timeline data for {ticker}")
-            return pd.DataFrame()
+            return pd.Series(dtype=float)
 
-        df = pd.DataFrame(records)
+        df   = pd.DataFrame(records)
         df["date"] = pd.to_datetime(df["date"])
-        df = df.set_index("date").sort_index()
+        df   = df.set_index("date").sort_index()
         df.index = df.index.tz_localize(None)
 
-        # Remove duplicate dates — keep mean if multiple entries per day
-        df = df.groupby(df.index).mean()
-
-        # Derived features
-        df["gdelt_tone_ma7"]    = df["gdelt_tone"].rolling(7, min_periods=1).mean()
-        df["gdelt_tone_change"] = df["gdelt_tone"].diff()
-        df["gdelt_positive"]    = (df["gdelt_tone"] > 0.5).astype(int)
-        df["gdelt_negative"]    = (df["gdelt_tone"] < -0.5).astype(int)
-
-        df.dropna(subset=["gdelt_tone"], inplace=True)
-
-        print(f"  Retrieved {len(df)} tone data points for {ticker}")
-        return df
+        # Average if multiple entries per date
+        series = df.groupby(df.index)["tone"].mean()
+        print(f"    '{query}': {len(series)} data points")
+        return series
 
     except requests.exceptions.Timeout:
-        print(f"  GDELT request timed out for {ticker} — skipping")
-        return pd.DataFrame()
+        print(f"    Timeout for query: '{query}'")
+        return pd.Series(dtype=float)
     except Exception as e:
-        print(f"  GDELT fetch failed for {ticker}: {e}")
+        print(f"    Failed for query '{query}': {e}")
+        return pd.Series(dtype=float)
+
+
+def fetch_gdelt_timelinetone(ticker: str, company_name: str) -> pd.DataFrame:
+    """
+    Fetch and average GDELT tone across multiple queries for a ticker.
+
+    Runs one API call per query string, collects tone timeseries from
+    each, then averages across all successful queries. This approach:
+        - Reduces empty response risk — if one query fails others succeed
+        - Captures broader terminology used across different news sources
+        - Smooths query-specific noise via averaging
+
+    Derived features computed on the averaged tone:
+        gdelt_tone       : averaged daily tone score across all queries
+        gdelt_tone_ma7   : 7-day smoothed tone
+        gdelt_tone_change: day-over-day change — sentiment momentum
+        gdelt_positive   : binary flag — tone > 0.5
+        gdelt_negative   : binary flag — tone < -0.5
+    """
+    queries  = get_gdelt_queries(ticker, company_name)
+    train_end = get_train_end(ticker)
+
+    start_dt = datetime.strptime(TRAIN_START, "%Y-%m-%d").strftime("%Y%m%d%H%M%S")
+    end_dt   = datetime.strptime(train_end, "%Y-%m-%d").strftime("%Y%m%d%H%M%S")
+
+    print(f"  Fetching GDELT timelinetone for {ticker} ({len(queries)} queries)...")
+
+    # Collect tone series from each query
+    all_series = []
+    for query in queries:
+        series = fetch_single_gdelt_tone(query, start_dt, end_dt)
+        if not series.empty:
+            all_series.append(series)
+        time.sleep(1)  # brief pause between queries
+
+    if not all_series:
+        print(f"  All GDELT queries failed for {ticker}")
         return pd.DataFrame()
+
+    # Average tone across all successful queries
+    combined      = pd.concat(all_series, axis=1)
+    combined.columns = [f"q{i}" for i in range(len(all_series))]
+    avg_tone      = combined.mean(axis=1)
+
+    df = pd.DataFrame({"gdelt_tone": avg_tone})
+
+    # Derived features
+    df["gdelt_tone_ma7"]    = df["gdelt_tone"].rolling(7, min_periods=1).mean()
+    df["gdelt_tone_change"] = df["gdelt_tone"].diff()
+    df["gdelt_positive"]    = (df["gdelt_tone"] > 0.5).astype(int)
+    df["gdelt_negative"]    = (df["gdelt_tone"] < -0.5).astype(int)
+
+    df.dropna(subset=["gdelt_tone"], inplace=True)
+
+    successful = len(all_series)
+    total      = len(queries)
+    print(f"  Retrieved {len(df)} tone data points ({successful}/{total} queries succeeded)")
+    return df
 
 
 def fetch_gdelt_sentiment(ticker: str, company_name: str) -> pd.DataFrame:
     """
-    Orchestrate GDELT sentiment fetching for a ticker.
+    Orchestrate GDELT sentiment fetching with caching.
 
-    Uses timelinetone mode — single API call per ticker, pre-computed
-    tone scores, no Gemini quota consumed, reliable historical coverage.
+    Loads from cache if data/{ticker}_gdelt_daily.csv exists and is
+    non-empty. Delete the cache file to force a fresh fetch.
 
-    Caching: saves result to data/{ticker}_gdelt_daily.csv on success.
-    Subsequent runs load from cache if file exists and is non-empty —
-    avoids redundant API calls when rerunning the pipeline.
-
-    Falls back gracefully if GDELT is unavailable — returns empty
-    DataFrame and logs a warning. ml_forecasting.py handles missing
-    GDELT files by skipping those feature columns rather than crashing.
+    Falls back gracefully on failure — returns empty DataFrame.
+    ml_forecasting.py skips GDELT features rather than crashing
+    when the cache file is absent.
     """
     cache_path = data_path(f"{ticker}_gdelt_daily.csv")
 
-    # Load from cache if available
     if os.path.exists(cache_path):
         cached = pd.read_csv(cache_path, index_col=0, parse_dates=True)
         if not cached.empty:
             print(f"  Loaded GDELT sentiment from cache ({len(cached)} rows)")
             return cached
 
-    # Fetch from API
     daily = fetch_gdelt_timelinetone(ticker, company_name)
 
     if daily.empty:
-        print(f"  No GDELT data available for {ticker} — sentiment features will be skipped")
+        print(f"  No GDELT data for {ticker} — sentiment features will be skipped")
         return pd.DataFrame()
 
-    # Save to cache
     daily.to_csv(cache_path)
-    print(f"  Saved GDELT daily sentiment to {cache_path} ({len(daily)} rows)")
-
+    print(f"  Saved to {cache_path} ({len(daily)} rows)")
     return daily
 
 
