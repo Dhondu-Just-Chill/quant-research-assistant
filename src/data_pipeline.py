@@ -22,7 +22,6 @@
 
 import os
 import sys
-import json
 import time
 import requests
 import warnings
@@ -32,7 +31,6 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 from pytrends.request import TrendReq
-from google import genai
 from dotenv import load_dotenv
 
 # Add project root to path so config.py is importable from src/
@@ -60,8 +58,6 @@ from config import (
 warnings.filterwarnings("ignore")
 load_dotenv()
 
-# Initialize Gemini client for GDELT headline scoring
-gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 
 # ── OHLCV ─────────────────────────────────────────────────────────────
@@ -260,284 +256,142 @@ def fetch_trends_data(ticker: str, company_name: str) -> pd.DataFrame:
 
 # ── GDELT ─────────────────────────────────────────────────────────────
 
-def fetch_gdelt_headlines(ticker: str, company_name: str,
-                          start: str, end: str) -> list[dict]:
+def fetch_gdelt_timelinetone(ticker: str, company_name: str) -> pd.DataFrame:
     """
-    Fetch news headlines from the GDELT DOC API for a date range.
+    Fetch pre-computed sentiment tone from GDELT DOC API timelinetone mode.
 
-    Uses the artlist mode to retrieve individual article headlines
-    rather than pre-aggregated tone scores — this lets us pipe
-    headlines through Gemini for financially-aware scoring rather
-    than relying on GDELT's dictionary-based tone computation.
+    timelinetone returns average article tone per time bucket across the
+    full query period — no Gemini calls needed. GDELT computes tone using
+    linguistic analysis across thousands of sources simultaneously.
 
-    Args:
-        ticker       : stock symbol
-        company_name : full company name for better query coverage
-        start        : start date string 'YYYY-MM-DD'
-        end          : end date string 'YYYY-MM-DD'
+    Tone scale: negative values = negative coverage, positive = positive.
+    Typical range is roughly -10 to +10 though extremes can exceed this.
 
-    Returns list of {headline, date, source} dicts.
+    Makes a single API call per ticker covering the full training window
+    rather than monthly chunks — more reliable than artlist mode which
+    frequently returns empty responses for historical date ranges.
+
+    Derived features:
+        gdelt_tone      : raw daily tone score
+        gdelt_tone_ma7  : 7-day smoothed tone — reduces daily noise
+        gdelt_tone_change: day-over-day tone change — sentiment momentum
+        gdelt_positive   : 1 if tone > 0.5, else 0 — binary positive signal
+        gdelt_negative   : 1 if tone < -0.5, else 0 — binary negative signal
     """
-    query = get_gdelt_query(ticker, company_name)
+    query     = get_gdelt_query(ticker, company_name)
+    train_end = get_train_end(ticker)
 
     # GDELT datetime format: YYYYMMDDHHMMSS
-    start_dt = datetime.strptime(start, "%Y-%m-%d").strftime("%Y%m%d%H%M%S")
-    end_dt   = datetime.strptime(end, "%Y-%m-%d").strftime("%Y%m%d%H%M%S")
+    start_dt = datetime.strptime(TRAIN_START, "%Y-%m-%d").strftime("%Y%m%d%H%M%S")
+    end_dt   = datetime.strptime(train_end, "%Y-%m-%d").strftime("%Y%m%d%H%M%S")
+
+    print(f"  Fetching GDELT timelinetone for '{query}'...")
 
     params = {
         "query":         query,
-        "mode":          "artlist",
-        "maxrecords":    GDELT_MAX_RECORDS,
+        "mode":          "timelinetone",
+        "format":        "json",
         "startdatetime": start_dt,
         "enddatetime":   end_dt,
-        "format":        "json",
-        "sort":          "DateDesc",
     }
 
     try:
-        response = requests.get(GDELT_API_URL, params=params, timeout=15)
+        response = requests.get(GDELT_API_URL, params=params, timeout=30)
+
+        if not response.text.strip():
+            print(f"  GDELT returned empty response for {ticker}")
+            return pd.DataFrame()
+
         data     = response.json()
-        articles = data.get("articles", [])
+        timeline = data.get("timeline", [])
 
-        results = []
-        for article in articles:
-            # GDELT date format: YYYYMMDDTHHMMSSZ
-            raw_date = article.get("seendate", "")
-            try:
-                date = datetime.strptime(
-                    raw_date[:8], "%Y%m%d"
-                ).strftime("%Y-%m-%d")
-            except Exception:
-                date = start
+        if not timeline:
+            print(f"  No timeline data returned for {ticker}")
+            return pd.DataFrame()
 
-            results.append({
-                "headline": article.get("title", ""),
-                "date":     date,
-                "source":   article.get("domain", "gdelt"),
-            })
+        # Each entry in timeline has a list of data points
+        # Structure: [{"series": [{"date": "...", "value": tone}, ...]}]
+        records = []
+        for series in timeline:
+            for point in series.get("data", []):
+                raw_date = point.get("date", "")
+                tone     = point.get("value", 0.0)
 
-        return results
+                try:
+                    # GDELT date format varies — handle both YYYYMMDDTHHMMSSZ and YYYY-MM-DD
+                    if "T" in raw_date:
+                        date = datetime.strptime(raw_date[:8], "%Y%m%d").strftime("%Y-%m-%d")
+                    else:
+                        date = raw_date[:10]
+                    records.append({"date": date, "gdelt_tone": float(tone)})
+                except Exception:
+                    continue
 
-    except Exception as e:
-        print(f"    GDELT fetch error ({start} → {end}): {e}")
-        return []
+        if not records:
+            print(f"  Could not parse GDELT timeline data for {ticker}")
+            return pd.DataFrame()
 
+        df = pd.DataFrame(records)
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.set_index("date").sort_index()
+        df.index = df.index.tz_localize(None)
 
-def score_headlines_gemini(headlines: list[dict],
-                           ticker: str) -> list[dict]:
-    """
-    Score a batch of headlines using Gemini for financial sentiment.
+        # Remove duplicate dates — keep mean if multiple entries per day
+        df = df.groupby(df.index).mean()
 
-    Gemini provides financially-aware scoring that understands context:
-        "beats estimates" → positive even without positive words
-        "misses revenue but raises guidance" → net positive
-        "faces antitrust probe" → negative regardless of neutral wording
+        # Derived features
+        df["gdelt_tone_ma7"]    = df["gdelt_tone"].rolling(7, min_periods=1).mean()
+        df["gdelt_tone_change"] = df["gdelt_tone"].diff()
+        df["gdelt_positive"]    = (df["gdelt_tone"] > 0.5).astype(int)
+        df["gdelt_negative"]    = (df["gdelt_tone"] < -0.5).astype(int)
 
-    Each headline scored on:
-        sentiment : positive / negative / neutral
-        score     : float -1.0 to +1.0
-        relevance : high / medium / low
+        df.dropna(subset=["gdelt_tone"], inplace=True)
 
-    Low-relevance headlines excluded from daily aggregate in
-    compute_daily_sentiment() to reduce noise.
-    """
-    if not headlines:
-        return []
+        print(f"  Retrieved {len(df)} tone data points for {ticker}")
+        return df
 
-    scored = []
-    for i in range(0, len(headlines), GEMINI_BATCH_SIZE):
-        batch = headlines[i:i + GEMINI_BATCH_SIZE]
-
-        headlines_text = "\n".join([
-            f"{j+1}. {h['headline']}"
-            for j, h in enumerate(batch)
-        ])
-
-        prompt = f"""You are a financial sentiment analyst.
-Score each headline's sentiment toward {ticker} stock.
-
-Headlines:
-{headlines_text}
-
-Return ONLY a JSON array. No markdown, no backticks, no preamble.
-Each element must have:
-  "index"     : headline number (1-based integer)
-  "sentiment" : "positive" | "negative" | "neutral"
-  "score"     : float from -1.0 (very negative) to 1.0 (very positive)
-  "relevance" : "high" | "medium" | "low"
-
-Example: [{{"index": 1, "sentiment": "positive", "score": 0.7, "relevance": "high"}}]"""
-
-        try:
-            response = gemini_client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt
-            )
-            text = response.text.strip()
-
-            # Strip markdown fences if Gemini adds them despite instructions
-            if text.startswith("```"):
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
-                text = text.rsplit("```", 1)[0]
-
-            batch_scores = json.loads(text.strip())
-
-            for item in batch_scores:
-                idx = item["index"] - 1
-                if 0 <= idx < len(batch):
-                    scored.append({
-                        **batch[idx],
-                        "sentiment": item.get("sentiment", "neutral"),
-                        "score":     float(item.get("score", 0.0)),
-                        "relevance": item.get("relevance", "medium"),
-                    })
-
-            time.sleep(GEMINI_RATE_LIMIT)
-
-        except Exception as e:
-            print(f"    Gemini scoring error: {e}")
-            for item in batch:
-                scored.append({
-                    **item,
-                    "sentiment": "neutral",
-                    "score":     0.0,
-                    "relevance": "low",
-                })
-
-    return scored
-
-
-def compute_daily_sentiment(scored: list[dict]) -> pd.DataFrame:
-    """
-    Aggregate Gemini-scored headlines into daily sentiment scores.
-
-    Only high and medium relevance headlines contribute to the
-    daily aggregate — filters noise from tangentially related articles.
-
-    Derived features:
-        gdelt_score    : mean sentiment score for the day (-1 to +1)
-        gdelt_ma7      : 7-day smoothed score — reduces daily noise
-        gdelt_change   : day-over-day score change — sentiment momentum
-        gdelt_positive : fraction of positive headlines that day
-        gdelt_negative : fraction of negative headlines that day
-    """
-    if not scored:
+    except requests.exceptions.Timeout:
+        print(f"  GDELT request timed out for {ticker} — skipping")
         return pd.DataFrame()
-
-    # Filter to relevant headlines
-    relevant = [
-        h for h in scored
-        if h.get("relevance") in ["high", "medium"]
-    ] or scored  # fallback to all if none flagged relevant
-
-    records = []
-    df_raw  = pd.DataFrame(relevant)
-
-    for date, group in df_raw.groupby("date"):
-        scores = group["score"].tolist()
-        n      = len(scores)
-        records.append({
-            "date":           date,
-            "gdelt_score":    float(np.mean(scores)),
-            "gdelt_positive": sum(1 for s in scores if s > 0.1) / n,
-            "gdelt_negative": sum(1 for s in scores if s < -0.1) / n,
-        })
-
-    result = pd.DataFrame(records)
-    result["date"] = pd.to_datetime(result["date"])
-    result         = result.set_index("date").sort_index()
-    result.index   = result.index.tz_localize(None)
-
-    # Smoothed score and momentum
-    result["gdelt_ma7"]    = result["gdelt_score"].rolling(7, min_periods=1).mean()
-    result["gdelt_change"] = result["gdelt_score"].diff()
-
-    return result
+    except Exception as e:
+        print(f"  GDELT fetch failed for {ticker}: {e}")
+        return pd.DataFrame()
 
 
 def fetch_gdelt_sentiment(ticker: str, company_name: str) -> pd.DataFrame:
     """
-    Orchestrate full GDELT sentiment pipeline for a ticker.
+    Orchestrate GDELT sentiment fetching for a ticker.
 
-    Fetches headlines in monthly chunks across the training window
-    to stay within GDELT API limits and avoid timeouts.
+    Uses timelinetone mode — single API call per ticker, pre-computed
+    tone scores, no Gemini quota consumed, reliable historical coverage.
 
-    Implements caching — if scored headlines already exist on disk
-    for a given month, skips that month entirely. This means:
-        - First run: fetches and scores all 3 years (slow, ~45 min)
-        - Subsequent runs: loads from cache instantly
-        - Partial runs: resumes from last completed month
+    Caching: saves result to data/{ticker}_gdelt_daily.csv on success.
+    Subsequent runs load from cache if file exists and is non-empty —
+    avoids redundant API calls when rerunning the pipeline.
 
-    Saves two files:
-        data/{ticker}_gdelt_raw.csv    : all scored headlines
-        data/{ticker}_gdelt_daily.csv  : daily aggregated scores
+    Falls back gracefully if GDELT is unavailable — returns empty
+    DataFrame and logs a warning. ml_forecasting.py handles missing
+    GDELT files by skipping those feature columns rather than crashing.
     """
-    train_end  = get_train_end(ticker)
-    cache_path = data_path(f"{ticker}_gdelt_raw.csv")
+    cache_path = data_path(f"{ticker}_gdelt_daily.csv")
 
-    # Load existing cache if present
-    existing_scored = []
-    cached_dates    = set()
-
+    # Load from cache if available
     if os.path.exists(cache_path):
-        cached_df    = pd.read_csv(cache_path, parse_dates=["date"])
-        existing_scored = cached_df.to_dict("records")
-        cached_dates = set(
-            pd.to_datetime(cached_df["date"]).dt.to_period("M").astype(str)
-        )
-        print(f"  Loaded {len(existing_scored)} cached headlines for {ticker}")
+        cached = pd.read_csv(cache_path, index_col=0, parse_dates=True)
+        if not cached.empty:
+            print(f"  Loaded GDELT sentiment from cache ({len(cached)} rows)")
+            return cached
 
-    # Generate monthly date ranges across training window
-    start_dt = datetime.strptime(TRAIN_START, "%Y-%m-%d")
-    end_dt   = datetime.strptime(train_end, "%Y-%m-%d")
+    # Fetch from API
+    daily = fetch_gdelt_timelinetone(ticker, company_name)
 
-    months = []
-    current = start_dt
-    while current <= end_dt:
-        next_month = (current.replace(day=28) + timedelta(days=4)).replace(day=1)
-        months.append((
-            current.strftime("%Y-%m-%d"),
-            min(next_month - timedelta(days=1), end_dt).strftime("%Y-%m-%d")
-        ))
-        current = next_month
-
-    # Fetch and score month by month — skip cached months
-    new_scored = []
-    for month_start, month_end in months:
-        period_key = pd.to_datetime(month_start).to_period("M").strftime("%Y-%m")
-
-        if period_key in cached_dates:
-            continue  # already scored — skip
-
-        print(f"    Fetching GDELT {month_start} → {month_end}...")
-        headlines = fetch_gdelt_headlines(ticker, company_name, month_start, month_end)
-
-        if headlines:
-            scored = score_headlines_gemini(headlines, ticker)
-            new_scored.extend(scored)
-
-        # Brief pause between months to respect GDELT rate limits
-        time.sleep(0.5)
-
-    # Combine cached + new scored headlines
-    all_scored = existing_scored + new_scored
-
-    if not all_scored:
-        print(f"  No GDELT headlines found for {ticker}")
+    if daily.empty:
+        print(f"  No GDELT data available for {ticker} — sentiment features will be skipped")
         return pd.DataFrame()
 
-    # Save raw scored headlines — overwrites with full combined dataset
-    raw_df = pd.DataFrame(all_scored)
-    raw_df.to_csv(cache_path, index=False)
-    print(f"  Saved {len(raw_df)} total scored headlines to {cache_path}")
-
-    # Compute and save daily aggregates
-    daily    = compute_daily_sentiment(all_scored)
-    daily_path = data_path(f"{ticker}_gdelt_daily.csv")
-    daily.to_csv(daily_path)
-    print(f"  Saved daily sentiment to {daily_path}")
+    # Save to cache
+    daily.to_csv(cache_path)
+    print(f"  Saved GDELT daily sentiment to {cache_path} ({len(daily)} rows)")
 
     return daily
 
