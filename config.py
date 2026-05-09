@@ -205,6 +205,29 @@ _GDELT_QUERY_MAP = {
     },
 }
 
+# ── INSIDER TRANSACTION SETTINGS ──────────────────────────────────────
+
+# OpenInsider URL — returns CSV directly, no authentication needed.
+# Parameters:
+#   s    : ticker symbol
+#   fd   : from date (days ago) — we calculate this dynamically
+#   xp   : exclude option exercises (1 = exclude) — critical filter
+#   xs   : exclude automatic 10b5-1 sales (1 = exclude)
+#   action=1 : trigger search
+OPENINSIDER_URL = "http://openinsider.com/screener"
+
+# Rolling window for insider feature computation.
+# 30 days captures recent insider sentiment without being too narrow.
+INSIDER_WINDOW_DAYS = 30
+
+# Minimum transaction value to include — filters out token/symbolic trades.
+# $10,000 is low enough to capture most meaningful buys,
+# high enough to filter out small tax-related transactions.
+INSIDER_MIN_VALUE = 10_000
+
+# Executive titles that constitute high-conviction signals.
+# CEO and CFO have the most complete view of company fundamentals.
+INSIDER_EXEC_TITLES = ["ceo", "cfo", "chief executive", "chief financial"]
 
 # ── GOOGLE TRENDS SETTINGS ────────────────────────────────────────────
 
