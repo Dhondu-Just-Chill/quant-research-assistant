@@ -309,6 +309,37 @@ def load_and_merge_gdelt(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     df = df.join(gdelt_aligned, how="left")
     return df
 
+# ── LAYER 8: INSIDER TRANSACTIONS FEATURES ───────────────────────────
+
+def load_and_merge_insider(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """
+    Merge insider transaction features into the feature matrix.
+
+    Features are pre-computed rolling aggregates — no forward-fill
+    needed since they're already computed on rolling windows.
+    Zero-fill any remaining NaN — no insider activity = neutral signal.
+
+    Features merged:
+        insider_buy_count_30d  : purchases in last 30 days
+        insider_sell_count_30d : sales in last 30 days
+        insider_net_30d        : net buy/sell direction
+        insider_buy_value_30d  : log-scaled buy value
+        insider_sell_value_30d : log-scaled sell value
+        insider_cluster_buy    : 2+ insiders bought — conviction signal
+        exec_bought_30d        : CEO/CFO bought — highest signal
+    """
+    insider_path = data_path(f"{ticker}_insider_daily.csv")
+    if not os.path.exists(insider_path):
+        print(f"  Warning: {ticker}_insider_daily.csv not found — skipping")
+        return df
+
+    insider = pd.read_csv(insider_path, index_col=0, parse_dates=True)
+    insider.index = pd.to_datetime(insider.index).tz_localize(None)
+
+    df = df.join(insider, how="left")
+    insider_cols = insider.columns.tolist()
+    df[insider_cols] = df[insider_cols].fillna(0)
+    return df
 
 # ── TARGET VARIABLE ───────────────────────────────────────────────────
 
@@ -606,6 +637,7 @@ def run_ml_pipeline(tickers: list = None) -> None:
             df = load_and_merge_earnings(df, ticker)
             df = load_and_merge_trends(df, ticker)
             df = load_and_merge_gdelt(df, ticker)
+            df = load_and_merge_insider(df, ticker)
 
             # Step 3 — Create labels
             print("[3/9] Creating labels...")

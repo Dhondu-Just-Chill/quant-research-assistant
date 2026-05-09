@@ -24,6 +24,7 @@ import sys
 import time
 import requests
 import warnings
+from io import StringIO
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -614,6 +615,302 @@ def fetch_gdelt_sentiment(ticker: str, company_name: str) -> pd.DataFrame:
     print(f"  Saved {len(result)} rows to {daily_path}")
     return result
 
+# ── INSIDER TRANSACTIONS ──────────────────────────────────────────────
+
+def fetch_insider_raw(ticker: str) -> pd.DataFrame:
+    """
+    Fetch raw insider transaction data from OpenInsider via CSV export.
+
+    OpenInsider exposes a screener endpoint that returns CSV directly.
+    We fetch all transactions since TRAIN_START — the date range
+    parameter (fd) is specified in days from today.
+
+    Filters applied at fetch time:
+        xp=1 : exclude option exercises — not discretionary buys
+        xs=1 : exclude automatic 10b5-1 plan sales — pre-scheduled,
+                not opportunistic, carry no information signal
+        xn=1 : exclude non-open-market transactions (gifts, grants)
+
+    Returns raw DataFrame with all transactions or empty DataFrame
+    on failure.
+    """
+    from config import OPENINSIDER_URL, TRAIN_START, INSIDER_MIN_VALUE
+
+    # Calculate days since TRAIN_START for the fd parameter
+    days_back = (datetime.now() - datetime.strptime(TRAIN_START, "%Y-%m-%d")).days + 30
+
+    params = {
+        "s":      ticker,
+        "fd":     days_back,       # from date in days
+        "xp":     1,               # exclude option exercises
+        "xs":     1,               # exclude 10b5-1 automatic sales
+        "xn":     1,               # exclude non-open-market
+        "action": "1",
+        "cnt":    "500",           # max records
+    }
+
+    try:
+        # OpenInsider returns CSV when you append &action=1 to screener URL
+        csv_url = f"{OPENINSIDER_URL}?s={ticker}&fd={days_back}&xp=1&xs=1&xn=1&cnt=500&action=1"
+        response = requests.get(
+            csv_url,
+            timeout=15,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+
+        if not response.text.strip():
+            print(f"  Empty response from OpenInsider for {ticker}")
+            return pd.DataFrame()
+
+        # OpenInsider returns HTML — parse the table
+        tables = pd.read_html(StringIO(response.text))
+
+        if not tables:
+            print(f"  No tables found in OpenInsider response for {ticker}")
+            return pd.DataFrame()
+
+        # The main transaction table is always the largest
+        df = max(tables, key=len)
+
+        if df.empty:
+            return pd.DataFrame()
+
+        # Standardize column names — OpenInsider columns vary slightly
+        df.columns = [str(c).lower().strip().replace(" ", "_") for c in df.columns]
+
+        print(f"  Raw insider rows: {len(df)}")
+        return df
+
+    except Exception as e:
+        print(f"  OpenInsider fetch failed for {ticker}: {e}")
+        return pd.DataFrame()
+
+
+def parse_insider_transactions(df_raw: pd.DataFrame,
+                               ticker: str) -> pd.DataFrame:
+    """
+    Parse and clean raw OpenInsider HTML table into structured DataFrame.
+
+    OpenInsider's HTML table has inconsistent column naming across
+    different tickers and time periods. This function handles the
+    mapping robustly using partial string matching rather than
+    exact column names.
+
+    Filters applied:
+        - Only open-market purchases (transaction type 'P')
+        - Value >= INSIDER_MIN_VALUE
+        - Valid trade dates within training window
+
+    Returns cleaned DataFrame with standardized columns:
+        trade_date  : datetime of the transaction
+        insider     : name of the insider
+        title       : their role/title
+        is_buy      : 1 for purchase, 0 for sale
+        value       : dollar value of transaction
+        is_exec     : 1 if CEO or CFO
+    """
+    from config import INSIDER_MIN_VALUE, INSIDER_EXEC_TITLES, TRAIN_START, INSIDER_MIN_VALUE
+
+    if df_raw.empty:
+        return pd.DataFrame()
+
+    # Find columns by partial name matching — robust to naming variations
+    def find_col(df, keywords):
+        for col in df.columns:
+            if any(k in col for k in keywords):
+                return col
+        return None
+
+    date_col  = find_col(df_raw, ["trade", "date"])
+    title_col = find_col(df_raw, ["title", "relation", "role"])
+    type_col  = find_col(df_raw, ["type", "transaction"])
+    value_col = find_col(df_raw, ["value", "$value", "amt"])
+    name_col  = find_col(df_raw, ["name", "insider", "filer"])
+
+    # If critical columns missing, return empty
+    if not date_col or not type_col:
+        print(f"  Could not identify required columns in {ticker} insider data")
+        print(f"  Available: {df_raw.columns.tolist()}")
+        return pd.DataFrame()
+
+    records = []
+    for _, row in df_raw.iterrows():
+        try:
+            # Parse trade date
+            raw_date = str(row.get(date_col, ""))
+            try:
+                trade_date = pd.to_datetime(raw_date[:10])
+            except Exception:
+                continue
+
+            # Filter to training window
+            if trade_date < pd.to_datetime(TRAIN_START):
+                continue
+
+            # Transaction type — only purchases
+            txn_type = str(row.get(type_col, "")).strip().upper()
+            is_buy   = 1 if txn_type in ["P", "PURCHASE", "BUY"] else 0
+
+            # Dollar value — clean currency formatting
+            raw_value = str(row.get(value_col, "0")) if value_col else "0"
+            raw_value = raw_value.replace("$", "").replace(",", "").replace("+", "").strip()
+            try:
+                value = abs(float(raw_value))
+            except Exception:
+                value = 0.0
+
+            # Filter minimum value
+            if value < INSIDER_MIN_VALUE:
+                continue
+
+            # Insider title
+            title = str(row.get(title_col, "")).lower() if title_col else ""
+            name  = str(row.get(name_col, "")) if name_col else ""
+
+            # Executive flag — CEO/CFO are highest conviction
+            is_exec = int(any(t in title for t in INSIDER_EXEC_TITLES))
+
+            records.append({
+                "trade_date": trade_date,
+                "insider":    name,
+                "title":      title,
+                "is_buy":     is_buy,
+                "value":      value,
+                "is_exec":    is_exec,
+            })
+
+        except Exception:
+            continue
+
+    if not records:
+        return pd.DataFrame()
+
+    result = pd.DataFrame(records)
+    result["trade_date"] = pd.to_datetime(result["trade_date"]).dt.tz_localize(None)
+    result = result.sort_values("trade_date")
+    print(f"  Parsed {len(result)} valid transactions "
+          f"({result['is_buy'].sum()} buys, "
+          f"{(1-result['is_buy']).sum()} sells)")
+    return result
+
+
+def compute_insider_features(transactions: pd.DataFrame,
+                              price_index: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Compute rolling insider transaction features aligned to trading days.
+
+    For each trading day in price_index, looks back INSIDER_WINDOW_DAYS
+    and computes aggregate features from all transactions in that window.
+
+    Features:
+        insider_buy_count_30d  : number of open-market purchases
+        insider_sell_count_30d : number of open-market sales
+        insider_net_30d        : buy_count - sell_count
+        insider_buy_value_30d  : log(1 + total buy value) — log-scaled
+        insider_sell_value_30d : log(1 + total sell value) — log-scaled
+        insider_cluster_buy    : 1 if 2+ insiders bought in window
+        exec_bought_30d        : 1 if CEO or CFO bought in window
+
+    Log-scaling value features prevents large transactions from
+    dominating the feature — a $50M CEO purchase vs $100k director
+    purchase becomes log(50M) vs log(100k) = 17.7 vs 11.5,
+    a manageable ratio rather than 500x.
+    """
+    from config import INSIDER_WINDOW_DAYS
+
+    if transactions.empty:
+        # Return zeros — model treats no insider data as neutral
+        result = pd.DataFrame(index=price_index)
+        for col in ["insider_buy_count_30d", "insider_sell_count_30d",
+                    "insider_net_30d", "insider_buy_value_30d",
+                    "insider_sell_value_30d", "insider_cluster_buy",
+                    "exec_bought_30d"]:
+            result[col] = 0
+        return result
+
+    records = []
+    for date in price_index:
+        window_start = date - timedelta(days=INSIDER_WINDOW_DAYS)
+
+        # All transactions in the rolling window
+        window = transactions[
+            (transactions["trade_date"] >= window_start) &
+            (transactions["trade_date"] <= date)
+        ]
+
+        buys  = window[window["is_buy"] == 1]
+        sells = window[window["is_buy"] == 0]
+
+        # Cluster buy — multiple insiders buying signals conviction
+        unique_buyers = buys["insider"].nunique() if not buys.empty else 0
+
+        records.append({
+            "date":                    date,
+            "insider_buy_count_30d":   len(buys),
+            "insider_sell_count_30d":  len(sells),
+            "insider_net_30d":         len(buys) - len(sells),
+            "insider_buy_value_30d":   np.log1p(buys["value"].sum()),
+            "insider_sell_value_30d":  np.log1p(sells["value"].sum()),
+            "insider_cluster_buy":     int(unique_buyers >= 2),
+            "exec_bought_30d":         int(buys["is_exec"].sum() > 0)
+                                       if not buys.empty else 0,
+        })
+
+    result = pd.DataFrame(records).set_index("date")
+    result.index = pd.to_datetime(result.index).tz_localize(None)
+    return result
+
+
+def fetch_insider_transactions(ticker: str) -> pd.DataFrame:
+    """
+    Orchestrate full insider transaction pipeline for a ticker.
+
+    Stages:
+        1. Fetch raw HTML table from OpenInsider
+        2. Parse and clean into structured transactions
+        3. Compute rolling features aligned to trading day index
+
+    Caches raw transactions to data/{ticker}_insider_raw.csv.
+    Saves daily features to data/{ticker}_insider_daily.csv.
+
+    Falls back gracefully — returns zero-filled features if
+    OpenInsider is unavailable. ml_forecasting.py merges these
+    features the same way regardless of whether real data or zeros.
+    """
+    cache_path = data_path(f"{ticker}_insider_raw.csv")
+    daily_path = data_path(f"{ticker}_insider_daily.csv")
+
+    # Load raw transactions from cache if available
+    if os.path.exists(cache_path):
+        print(f"  Loading insider transactions from cache...")
+        transactions = pd.read_csv(cache_path, parse_dates=["trade_date"])
+        transactions["trade_date"] = pd.to_datetime(
+            transactions["trade_date"]
+        ).dt.tz_localize(None)
+    else:
+        # Fetch from OpenInsider
+        df_raw       = fetch_insider_raw(ticker)
+        transactions = parse_insider_transactions(df_raw, ticker)
+
+        if not transactions.empty:
+            transactions.to_csv(cache_path, index=False)
+            print(f"  Cached {len(transactions)} transactions")
+
+    # Load price index to align features to trading days
+    raw_path = data_path(f"{ticker}_raw.csv")
+    if not os.path.exists(raw_path):
+        print(f"  Warning: {ticker}_raw.csv not found — cannot align insider features")
+        return pd.DataFrame()
+
+    price_df    = pd.read_csv(raw_path, index_col=0, parse_dates=True)
+    price_index = pd.to_datetime(price_df.index).tz_localize(None)
+
+    # Compute rolling features
+    daily = compute_insider_features(transactions, price_index)
+
+    daily.to_csv(daily_path)
+    print(f"  Saved insider features to {daily_path} ({len(daily)} rows)")
+    return daily
 
 # ── COMPANY NAME ──────────────────────────────────────────────────────
 
@@ -707,6 +1004,17 @@ def run_data_pipeline(tickers: list = None) -> None:
             company_name = get_company_name(ticker)
             print(f"Processing {ticker} ({company_name})...")
             fetch_gdelt_sentiment(ticker, company_name)
+        except Exception as e:
+            print(f"  ERROR {ticker}: {e}")
+    
+    # Stage 6 — Insider Transactions
+    print("\n" + "=" * 50)
+    print("Stage 6: Insider Transactions (OpenInsider)")
+    print("=" * 50)
+    for ticker in tickers:
+        try:
+            print(f"Processing {ticker}...")
+            fetch_insider_transactions(ticker)
         except Exception as e:
             print(f"  ERROR {ticker}: {e}")
 
