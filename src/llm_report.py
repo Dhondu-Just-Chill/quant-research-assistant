@@ -4,9 +4,6 @@ import os
 import json
 import time
 from datetime import datetime, timedelta
-from urllib import response
-
-from click import prompt
 import joblib
 import pandas as pd
 import numpy as np
@@ -319,7 +316,7 @@ def load_ml_prediction(ticker: str, data_path: str = None) -> dict:
         return {"error": f"No data found at {raw_path}"}
 
     # Import feature engineering from ml_forecasting
-    from ml_forecasting import add_technical_indicators, load_and_merge_macro, load_and_merge_earnings
+    from ml_forecasting import add_technical_indicators
 
     df = pd.read_csv(raw_path, index_col=0, parse_dates=True)
     df = add_technical_indicators(df, ticker)
