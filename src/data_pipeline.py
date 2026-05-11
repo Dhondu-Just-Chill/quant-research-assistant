@@ -24,7 +24,6 @@ import sys
 import time
 import requests
 import warnings
-from io import StringIO
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -46,7 +45,6 @@ from config import (
     FINBERT_BATCH_SIZE,
     FINBERT_MAX_LENGTH,
     FINBERT_SCORE_MAP,
-    TRENDS_RESOLUTION,
     INSIDER_EXEC_TITLES, 
     INSIDER_MIN_VALUE,
     DATA_DIR,
@@ -511,37 +509,38 @@ def is_gdelt_cache_complete(ticker: str) -> bool:
 
     except Exception:
         return False
-    
-    def _build_daily_from_records(records: list, daily_path: str) -> pd.DataFrame:
-        """
-        Build and save the daily sentiment CSV from monthly cache records.
-        Called when all months are cached but daily CSV needs rebuilding.
-        """
-        if not records:
-            return pd.DataFrame()
 
-        cache_df = pd.DataFrame(records)
-        cache_df["date"] = pd.to_datetime(cache_df["date"])
 
-        daily = cache_df.set_index("date").sort_index()
-        daily.index = daily.index.tz_localize(None)
-        daily = daily.groupby(daily.index).mean()
+def _build_daily_from_records(records: list, daily_path: str) -> pd.DataFrame:
+    """
+    Build and save the daily sentiment CSV from monthly cache records.
+    Called when all months are cached but daily CSV needs rebuilding.
+    """
+    if not records:
+        return pd.DataFrame()
 
-        company_features = compute_layer_features(
-            daily["company_tone"].dropna(), "company"
-        )
-        sector_features = compute_layer_features(
-            daily["sector_tone"].dropna(), "sector"
-        )
+    cache_df = pd.DataFrame(records)
+    cache_df["date"] = pd.to_datetime(cache_df["date"])
 
-        result = company_features.join(sector_features, how="outer")
-        result["gdelt_composite"] = (
-            result["company_tone"].fillna(0) * GDELT_COMPANY_WEIGHT +
-            result["sector_tone"].fillna(0) * GDELT_SECTOR_WEIGHT
-        )
+    daily = cache_df.set_index("date").sort_index()
+    daily.index = daily.index.tz_localize(None)
+    daily = daily.groupby(daily.index).mean()
 
-        result.to_csv(daily_path)
-        return result
+    company_features = compute_layer_features(
+        daily["company_tone"].dropna(), "company"
+    )
+    sector_features = compute_layer_features(
+        daily["sector_tone"].dropna(), "sector"
+    )
+
+    result = company_features.join(sector_features, how="outer")
+    result["gdelt_composite"] = (
+        result["company_tone"].fillna(0) * GDELT_COMPANY_WEIGHT +
+        result["sector_tone"].fillna(0) * GDELT_SECTOR_WEIGHT
+    )
+
+    result.to_csv(daily_path)
+    return result
 
 
 def fetch_gdelt_sentiment(ticker: str, company_name: str) -> pd.DataFrame:
@@ -607,7 +606,7 @@ def fetch_gdelt_sentiment(ticker: str, company_name: str) -> pd.DataFrame:
 
     if not months_needed:
         # All months cached — rebuild daily CSV from monthly cache and return
-        print(f"  All months cached — rebuilding daily CSV without FinBERT...")
+        print("  All months cached — rebuilding daily CSV without FinBERT...")
         cached_df    = pd.read_csv(cache_path, parse_dates=["date"])
         cached_records = cached_df.to_dict("records")
         return _build_daily_from_records(cached_records, daily_path)
@@ -778,8 +777,6 @@ def get_cik_for_ticker(ticker: str) -> str:
     CIK is the SEC's internal company identifier — required to fetch
     Form 4 filings from EDGAR. Cached in memory during pipeline run.
     """
-    url = f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22&dateRange=custom&startdt=2020-01-01&enddt=2020-01-02&forms=4"
-    
     # Use the company tickers JSON — most reliable CIK lookup
     try:
         response = requests.get(
@@ -872,8 +869,6 @@ def fetch_insider_raw(ticker: str) -> pd.DataFrame:
             xml_url   = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_clean}/{acc_num}.txt"
 
             # Try the index page to find the actual XML file
-            idx_url  = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type=4&dateb=&owner=include&count=40"
-
             # Fetch filing index
             acc_url  = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_clean}/"
             r        = requests.get(acc_url, headers=headers, timeout=10)
@@ -914,8 +909,6 @@ def fetch_insider_raw(ticker: str) -> pd.DataFrame:
                 date_el  = txn.find(".//transactionDate/value")
                 shares_el = txn.find(".//transactionShares/value")
                 price_el  = txn.find(".//transactionPricePerShare/value")
-                disp_el   = txn.find(".//transactionAcquiredDisposedCode/value")
-
                 if code_el is None or date_el is None:
                     continue
 
@@ -1061,7 +1054,7 @@ def fetch_insider_transactions(ticker: str) -> pd.DataFrame:
 
     # Load raw transactions from cache if available
     if os.path.exists(cache_path):
-        print(f"  Loading insider transactions from cache...")
+        print("  Loading insider transactions from cache...")
         transactions = pd.read_csv(cache_path, parse_dates=["trade_date"])
         transactions["trade_date"] = pd.to_datetime(
             transactions["trade_date"]
@@ -1069,7 +1062,7 @@ def fetch_insider_transactions(ticker: str) -> pd.DataFrame:
     else:
         # Fetch from OpenInsider
         df_raw       = fetch_insider_raw(ticker)
-        transactions = parse_insider_transactions(df_raw, ticker)
+        transactions = df_raw
 
         if not transactions.empty:
             transactions.to_csv(cache_path, index=False)
