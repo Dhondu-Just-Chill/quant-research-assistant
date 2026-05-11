@@ -47,6 +47,8 @@ from config import (
     FINBERT_MAX_LENGTH,
     FINBERT_SCORE_MAP,
     TRENDS_RESOLUTION,
+    INSIDER_EXEC_TITLES, 
+    INSIDER_MIN_VALUE,
     DATA_DIR,
     data_path,
     get_train_end,
@@ -509,6 +511,37 @@ def is_gdelt_cache_complete(ticker: str) -> bool:
 
     except Exception:
         return False
+    
+    def _build_daily_from_records(records: list, daily_path: str) -> pd.DataFrame:
+        """
+        Build and save the daily sentiment CSV from monthly cache records.
+        Called when all months are cached but daily CSV needs rebuilding.
+        """
+        if not records:
+            return pd.DataFrame()
+
+        cache_df = pd.DataFrame(records)
+        cache_df["date"] = pd.to_datetime(cache_df["date"])
+
+        daily = cache_df.set_index("date").sort_index()
+        daily.index = daily.index.tz_localize(None)
+        daily = daily.groupby(daily.index).mean()
+
+        company_features = compute_layer_features(
+            daily["company_tone"].dropna(), "company"
+        )
+        sector_features = compute_layer_features(
+            daily["sector_tone"].dropna(), "sector"
+        )
+
+        result = company_features.join(sector_features, how="outer")
+        result["gdelt_composite"] = (
+            result["company_tone"].fillna(0) * GDELT_COMPANY_WEIGHT +
+            result["sector_tone"].fillna(0) * GDELT_SECTOR_WEIGHT
+        )
+
+        result.to_csv(daily_path)
+        return result
 
 
 def fetch_gdelt_sentiment(ticker: str, company_name: str) -> pd.DataFrame:
@@ -545,6 +578,41 @@ def fetch_gdelt_sentiment(ticker: str, company_name: str) -> pd.DataFrame:
         cached = pd.read_csv(daily_path, index_col=0, parse_dates=True)
         print(f"  Cache complete — skipping FinBERT ({len(cached)} rows)")
         return cached
+    
+    # ── Pre-check: how many months need scoring? ──────────────────────
+    # This runs BEFORE loading FinBERT — only load if work is needed
+    cached_months = set()
+    if os.path.exists(cache_path):
+        cached_df     = pd.read_csv(cache_path, parse_dates=["date"])
+        cached_months = set(
+            pd.to_datetime(cached_df["date"]).dt.to_period("M").astype(str)
+        )
+
+        # Generate all months in training window
+    train_end = get_train_end(ticker)
+    start_dt  = datetime.strptime(TRAIN_START, "%Y-%m-%d")
+    end_dt    = datetime.strptime(train_end, "%Y-%m-%d")
+    all_months = set()
+    current    = start_dt
+    while current <= end_dt:
+        all_months.add(
+            current.to_period("M").strftime("%Y-%m")
+            if hasattr(current, "to_period")
+            else pd.Period(current, "M").strftime("%Y-%m")
+        )
+        next_month = (current.replace(day=28) + timedelta(days=4)).replace(day=1)
+        current    = next_month
+
+    months_needed = all_months - cached_months
+
+    if not months_needed:
+        # All months cached — rebuild daily CSV from monthly cache and return
+        print(f"  All months cached — rebuilding daily CSV without FinBERT...")
+        cached_df    = pd.read_csv(cache_path, parse_dates=["date"])
+        cached_records = cached_df.to_dict("records")
+        return _build_daily_from_records(cached_records, daily_path)
+
+    print(f"  {len(months_needed)} months need scoring — loading FinBERT...")
 
     # ── Load monthly cache ────────────────────────────────────────────
     cached_records = []
@@ -699,184 +767,211 @@ def fetch_gdelt_sentiment(ticker: str, company_name: str) -> pd.DataFrame:
     print(f"  Saved {len(result)} rows → {daily_path}")
     return result
 
+
+
 # ── INSIDER TRANSACTIONS ──────────────────────────────────────────────
+
+def get_cik_for_ticker(ticker: str) -> str:
+    """
+    Get SEC CIK number for a ticker using EDGAR company search API.
+
+    CIK is the SEC's internal company identifier — required to fetch
+    Form 4 filings from EDGAR. Cached in memory during pipeline run.
+    """
+    url = f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22&dateRange=custom&startdt=2020-01-01&enddt=2020-01-02&forms=4"
+    
+    # Use the company tickers JSON — most reliable CIK lookup
+    try:
+        response = requests.get(
+            "https://www.sec.gov/files/company_tickers.json",
+            headers={"User-Agent": "QuantResearch contact@example.com"},
+            timeout=15
+        )
+        data = response.json()
+        
+        for entry in data.values():
+            if entry.get("ticker", "").upper() == ticker.upper():
+                cik = str(entry["cik_str"]).zfill(10)
+                return cik
+        
+        print(f"  CIK not found for {ticker}")
+        return None
+        
+    except Exception as e:
+        print(f"  CIK lookup failed for {ticker}: {e}")
+        return None
+
 
 def fetch_insider_raw(ticker: str) -> pd.DataFrame:
     """
-    Fetch raw insider transaction data from OpenInsider via CSV export.
+    Fetch Form 4 insider transactions directly from SEC EDGAR API.
 
-    OpenInsider exposes a screener endpoint that returns CSV directly.
-    We fetch all transactions since TRAIN_START — the date range
-    parameter (fd) is specified in days from today.
+    Uses the official EDGAR submissions API which returns structured
+    JSON — no HTML parsing, no scraping, authoritative source.
 
-    Filters applied at fetch time:
-        xp=1 : exclude option exercises — not discretionary buys
-        xs=1 : exclude automatic 10b5-1 plan sales — pre-scheduled,
-                not opportunistic, carry no information signal
-        xn=1 : exclude non-open-market transactions (gifts, grants)
+    Endpoint: data.sec.gov/submissions/CIK{cik}.json
+    Returns all Form 4 filings with transaction details.
 
-    Returns raw DataFrame with all transactions or empty DataFrame
-    on failure.
+    Transaction codes (SEC standard):
+        P  : open-market purchase     ← strong buy signal
+        S  : open-market sale         ← weak signal
+        A  : grant/award              ← ignore — not discretionary
+        M  : option exercise          ← ignore — not discretionary
+        F  : tax withholding          ← ignore — not discretionary
+        D  : disposition to company   ← ignore
     """
-    from config import OPENINSIDER_URL, TRAIN_START, INSIDER_MIN_VALUE
+    headers = {"User-Agent": "QuantResearch contact@example.com"}
 
-    # Calculate days since TRAIN_START for the fd parameter
-    days_back = (datetime.now() - datetime.strptime(TRAIN_START, "%Y-%m-%d")).days + 30
+    # Step 1 — Get CIK
+    cik = get_cik_for_ticker(ticker)
+    if not cik:
+        return pd.DataFrame()
 
-    params = {
-        "s":      ticker,
-        "fd":     days_back,       # from date in days
-        "xp":     1,               # exclude option exercises
-        "xs":     1,               # exclude 10b5-1 automatic sales
-        "xn":     1,               # exclude non-open-market
-        "action": "1",
-        "cnt":    "500",           # max records
-    }
-
+    # Step 2 — Fetch submissions from EDGAR
+    url = f"https://data.sec.gov/submissions/CIK{cik}.json"
     try:
-        # OpenInsider returns CSV when you append &action=1 to screener URL
-        csv_url = f"{OPENINSIDER_URL}?s={ticker}&fd={days_back}&xp=1&xs=1&xn=1&cnt=500&action=1"
-        response = requests.get(
-            csv_url,
-            timeout=15,
-            headers={"User-Agent": "Mozilla/5.0"}
-        )
-
-        if not response.text.strip():
-            print(f"  Empty response from OpenInsider for {ticker}")
-            return pd.DataFrame()
-
-        # OpenInsider returns HTML — parse the table
-        tables = pd.read_html(StringIO(response.text))
-
-        if not tables:
-            print(f"  No tables found in OpenInsider response for {ticker}")
-            return pd.DataFrame()
-
-        # The main transaction table is always the largest
-        df = max(tables, key=len)
-
-        if df.empty:
-            return pd.DataFrame()
-
-        # Standardize column names — OpenInsider columns vary slightly
-        df.columns = [str(c).lower().strip().replace(" ", "_") for c in df.columns]
-
-        print(f"  Raw insider rows: {len(df)}")
-        return df
-
+        response = requests.get(url, headers=headers, timeout=20)
+        data     = response.json()
     except Exception as e:
-        print(f"  OpenInsider fetch failed for {ticker}: {e}")
+        print(f"  EDGAR API failed for {ticker}: {e}")
         return pd.DataFrame()
 
-
-def parse_insider_transactions(df_raw: pd.DataFrame,
-                               ticker: str) -> pd.DataFrame:
-    """
-    Parse and clean raw OpenInsider HTML table into structured DataFrame.
-
-    OpenInsider's HTML table has inconsistent column naming across
-    different tickers and time periods. This function handles the
-    mapping robustly using partial string matching rather than
-    exact column names.
-
-    Filters applied:
-        - Only open-market purchases (transaction type 'P')
-        - Value >= INSIDER_MIN_VALUE
-        - Valid trade dates within training window
-
-    Returns cleaned DataFrame with standardized columns:
-        trade_date  : datetime of the transaction
-        insider     : name of the insider
-        title       : their role/title
-        is_buy      : 1 for purchase, 0 for sale
-        value       : dollar value of transaction
-        is_exec     : 1 if CEO or CFO
-    """
-    from config import INSIDER_MIN_VALUE, INSIDER_EXEC_TITLES, TRAIN_START, INSIDER_MIN_VALUE
-
-    if df_raw.empty:
+    # Step 3 — Extract Form 4 filings from recent filings
+    filings = data.get("filings", {}).get("recent", {})
+    if not filings:
+        print(f"  No filings found for {ticker}")
         return pd.DataFrame()
 
-    # Find columns by partial name matching — robust to naming variations
-    def find_col(df, keywords):
-        for col in df.columns:
-            if any(k in col for k in keywords):
-                return col
-        return None
+    forms        = filings.get("form", [])
+    dates        = filings.get("filingDate", [])
+    accessions   = filings.get("accessionNumber", [])
 
-    date_col  = find_col(df_raw, ["trade", "date"])
-    title_col = find_col(df_raw, ["title", "relation", "role"])
-    type_col  = find_col(df_raw, ["type", "transaction"])
-    value_col = find_col(df_raw, ["value", "$value", "amt"])
-    name_col  = find_col(df_raw, ["name", "insider", "filer"])
+    # Filter to Form 4 only within training window
+    train_start = pd.to_datetime(TRAIN_START)
+    train_end   = pd.to_datetime(get_train_end(ticker))
 
-    # If critical columns missing, return empty
-    if not date_col or not type_col:
-        print(f"  Could not identify required columns in {ticker} insider data")
-        print(f"  Available: {df_raw.columns.tolist()}")
+    form4_accessions = []
+    for form, date, acc in zip(forms, dates, accessions):
+        if form in ["4", "4/A"]:
+            filing_date = pd.to_datetime(date)
+            if train_start <= filing_date <= train_end:
+                form4_accessions.append((date, acc))
+
+    if not form4_accessions:
+        print(f"  No Form 4 filings in training window for {ticker}")
         return pd.DataFrame()
 
+    print(f"  Found {len(form4_accessions)} Form 4 filings — parsing transactions...")
+
+    # Step 4 — Parse each Form 4 XML for transaction details
     records = []
-    for _, row in df_raw.iterrows():
+    for filing_date, acc_num in form4_accessions[:200]:  # cap at 200 filings
         try:
-            # Parse trade date
-            raw_date = str(row.get(date_col, ""))
-            try:
-                trade_date = pd.to_datetime(raw_date[:10])
-            except Exception:
+            # Format accession number for URL
+            acc_clean = acc_num.replace("-", "")
+            xml_url   = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_clean}/{acc_num}.txt"
+
+            # Try the index page to find the actual XML file
+            idx_url  = f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type=4&dateb=&owner=include&count=40"
+
+            # Fetch filing index
+            acc_url  = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_clean}/"
+            r        = requests.get(acc_url, headers=headers, timeout=10)
+
+            # Find XML file in the index
+            import re
+            xml_files = re.findall(r'href="([^"]+\.xml)"', r.text, re.IGNORECASE)
+            if not xml_files:
                 continue
 
-            # Filter to training window
-            if trade_date < pd.to_datetime(TRAIN_START):
+            xml_url = f"https://www.sec.gov{xml_files[0]}" \
+                      if xml_files[0].startswith("/") else xml_files[0]
+
+            xml_r = requests.get(xml_url, headers=headers, timeout=10)
+            if not xml_r.text.strip():
                 continue
 
-            # Transaction type — only purchases
-            txn_type = str(row.get(type_col, "")).strip().upper()
-            is_buy   = 1 if txn_type in ["P", "PURCHASE", "BUY"] else 0
+            # Parse XML
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(xml_r.content)
 
-            # Dollar value — clean currency formatting
-            raw_value = str(row.get(value_col, "0")) if value_col else "0"
-            raw_value = raw_value.replace("$", "").replace(",", "").replace("+", "").strip()
-            try:
-                value = abs(float(raw_value))
-            except Exception:
-                value = 0.0
+            # Get reporter info
+            reporter  = root.find(".//reportingOwner")
+            name      = ""
+            title     = ""
+            is_exec   = 0
 
-            # Filter minimum value
-            if value < INSIDER_MIN_VALUE:
-                continue
+            if reporter is not None:
+                name_el  = reporter.find(".//rptOwnerName")
+                title_el = reporter.find(".//officerTitle")
+                name     = name_el.text.strip() if name_el is not None and name_el.text else ""
+                title    = title_el.text.strip().lower() if title_el is not None and title_el.text else ""
+                is_exec  = int(any(t in title for t in INSIDER_EXEC_TITLES))
 
-            # Insider title
-            title = str(row.get(title_col, "")).lower() if title_col else ""
-            name  = str(row.get(name_col, "")) if name_col else ""
+            # Parse non-derivative transactions (actual stock buys/sells)
+            for txn in root.findall(".//nonDerivativeTransaction"):
+                code_el  = txn.find(".//transactionCode")
+                date_el  = txn.find(".//transactionDate/value")
+                shares_el = txn.find(".//transactionShares/value")
+                price_el  = txn.find(".//transactionPricePerShare/value")
+                disp_el   = txn.find(".//transactionAcquiredDisposedCode/value")
 
-            # Executive flag — CEO/CFO are highest conviction
-            is_exec = int(any(t in title for t in INSIDER_EXEC_TITLES))
+                if code_el is None or date_el is None:
+                    continue
 
-            records.append({
-                "trade_date": trade_date,
-                "insider":    name,
-                "title":      title,
-                "is_buy":     is_buy,
-                "value":      value,
-                "is_exec":    is_exec,
-            })
+                code = code_el.text.strip().upper() if code_el.text else ""
+
+                # Only P (purchase) and S (sale) — skip grants, exercises etc.
+                if code not in ["P", "S"]:
+                    continue
+
+                try:
+                    trade_date = pd.to_datetime(date_el.text.strip())
+                except Exception:
+                    trade_date = pd.to_datetime(filing_date)
+
+                # Filter to training window
+                if not (train_start <= trade_date <= train_end):
+                    continue
+
+                try:
+                    shares = float(shares_el.text.strip()) if shares_el is not None and shares_el.text else 0
+                    price  = float(price_el.text.strip())  if price_el is not None and price_el.text else 0
+                    value  = shares * price
+                except Exception:
+                    value = 0.0
+
+                if value < INSIDER_MIN_VALUE:
+                    continue
+
+                is_buy = 1 if code == "P" else 0
+
+                records.append({
+                    "trade_date": trade_date,
+                    "insider":    name,
+                    "title":      title,
+                    "is_buy":     is_buy,
+                    "value":      value,
+                    "is_exec":    is_exec,
+                })
+
+            time.sleep(0.1)  # respect EDGAR rate limit — 10 req/sec max
 
         except Exception:
             continue
 
     if not records:
+        print(f"  No valid transactions parsed for {ticker}")
         return pd.DataFrame()
 
-    result = pd.DataFrame(records)
-    result["trade_date"] = pd.to_datetime(result["trade_date"]).dt.tz_localize(None)
-    result = result.sort_values("trade_date")
-    print(f"  Parsed {len(result)} valid transactions "
-          f"({result['is_buy'].sum()} buys, "
-          f"{(1-result['is_buy']).sum()} sells)")
-    return result
+    df = pd.DataFrame(records)
+    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.tz_localize(None)
+    df = df.sort_values("trade_date").reset_index(drop=True)
 
+    buys  = df["is_buy"].sum()
+    sells = len(df) - buys
+    print(f"  Parsed {len(df)} transactions ({buys} buys, {sells} sells)")
+    return df
 
 def compute_insider_features(transactions: pd.DataFrame,
                               price_index: pd.DatetimeIndex) -> pd.DataFrame:
@@ -1071,6 +1166,10 @@ def run_data_pipeline(tickers: list = None) -> None:
     print("=" * 50)
     for ticker in tickers:
         try:
+            trends_path = data_path(f"{ticker}_trends.csv")
+            if os.path.exists(trends_path):
+                print(f"  {ticker}: loaded from cache")
+                continue                    # skip — use existing file
             company_name = get_company_name(ticker)
             trends       = fetch_trends_data(ticker, company_name)
             if not trends.empty:
