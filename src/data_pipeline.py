@@ -511,37 +511,38 @@ def is_gdelt_cache_complete(ticker: str) -> bool:
 
     except Exception:
         return False
-    
-    def _build_daily_from_records(records: list, daily_path: str) -> pd.DataFrame:
-        """
-        Build and save the daily sentiment CSV from monthly cache records.
-        Called when all months are cached but daily CSV needs rebuilding.
-        """
-        if not records:
-            return pd.DataFrame()
 
-        cache_df = pd.DataFrame(records)
-        cache_df["date"] = pd.to_datetime(cache_df["date"])
 
-        daily = cache_df.set_index("date").sort_index()
-        daily.index = daily.index.tz_localize(None)
-        daily = daily.groupby(daily.index).mean()
+def _build_daily_from_records(records: list, daily_path: str) -> pd.DataFrame:
+    """
+    Build and save the daily sentiment CSV from monthly cache records.
+    Called when all months are cached but daily CSV needs rebuilding.
+    """
+    if not records:
+        return pd.DataFrame()
 
-        company_features = compute_layer_features(
-            daily["company_tone"].dropna(), "company"
-        )
-        sector_features = compute_layer_features(
-            daily["sector_tone"].dropna(), "sector"
-        )
+    cache_df = pd.DataFrame(records)
+    cache_df["date"] = pd.to_datetime(cache_df["date"])
 
-        result = company_features.join(sector_features, how="outer")
-        result["gdelt_composite"] = (
-            result["company_tone"].fillna(0) * GDELT_COMPANY_WEIGHT +
-            result["sector_tone"].fillna(0) * GDELT_SECTOR_WEIGHT
-        )
+    daily = cache_df.set_index("date").sort_index()
+    daily.index = daily.index.tz_localize(None)
+    daily = daily.groupby(daily.index).mean()
 
-        result.to_csv(daily_path)
-        return result
+    company_features = compute_layer_features(
+        daily["company_tone"].dropna(), "company"
+    )
+    sector_features = compute_layer_features(
+        daily["sector_tone"].dropna(), "sector"
+    )
+
+    result = company_features.join(sector_features, how="outer")
+    result["gdelt_composite"] = (
+        result["company_tone"].fillna(0) * GDELT_COMPANY_WEIGHT +
+        result["sector_tone"].fillna(0) * GDELT_SECTOR_WEIGHT
+    )
+
+    result.to_csv(daily_path)
+    return result
 
 
 def fetch_gdelt_sentiment(ticker: str, company_name: str) -> pd.DataFrame:
@@ -1211,14 +1212,4 @@ def run_data_pipeline(tickers: list = None) -> None:
 
 
 if __name__ == "__main__":
-    # Delete old GDELT daily CSVs — new pipeline produces different columns
-    for ticker in PRETRAINED_TICKERS:
-        old_daily = data_path(f"{ticker}_gdelt_daily.csv")
-        old_cache = data_path(f"{ticker}_gdelt_monthly_cache.csv")
-        old_raw   = data_path(f"{ticker}_gdelt_raw.csv")
-        for path in [old_daily, old_cache, old_raw]:
-            if os.path.exists(path):
-                os.remove(path)
-                print(f"Cleared old cache: {path}")
-
     run_data_pipeline()
