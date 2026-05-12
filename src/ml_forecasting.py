@@ -19,15 +19,15 @@
 import os
 import sys
 import warnings
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import joblib
 import numpy as np
 import pandas as pd
-import yfinance as yf
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import yfinance as yf
 from sklearn.inspection import permutation_importance
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
@@ -37,14 +37,17 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import (
     PRETRAINED_TICKERS,
+    TRAIN_START,
     TEST_SIZE,
     RANDOM_STATE,
     N_CV_SPLITS,
     PARAM_GRID,
     INFERENCE_LOOKBACK_MONTHS,
+    INFERENCE_START,
     data_path,
     model_path,
     output_path,
+    get_train_end,
     is_etf,
     update_registry,
     save_registry,
@@ -132,6 +135,7 @@ def add_technical_indicators(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
 
     # ── Layer 2: OHLC Structure Features ─────────────────────────────
 
+    body_size       = (close - open_).abs()
     candle_range    = (high - low).replace(0, np.nan)
 
     df["overnight_gap"]   = (open_ - close.shift()) / close.shift()
@@ -491,7 +495,7 @@ def select_features(model: XGBClassifier,
     kept_features = X_train.columns[keep_mask].tolist()
 
     if len(kept_features) == len(X_train.columns):
-        print("  No features pruned — all contribute positively")
+        print(f"  No features pruned — all contribute positively")
         return model, X_train.columns.tolist()
 
     # Retrain on pruned feature set
@@ -604,6 +608,9 @@ def run_ml_pipeline(tickers: list = None) -> None:
     """
     if tickers is None:
         tickers = PRETRAINED_TICKERS
+
+    # Load existing registry to preserve entries for untouched tickers
+    registry = load_registry()
 
     results = {}
 
@@ -734,7 +741,7 @@ def fetch_live_features(ticker: str) -> pd.DataFrame:
     aligned to the feature list the saved model was trained on.
     """
     from data_pipeline import (
-        fetch_macro_data,
+        fetch_market_data, fetch_macro_data,
         fetch_trends_data, fetch_gdelt_sentiment,
         get_company_name,
     )
