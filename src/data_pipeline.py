@@ -545,75 +545,24 @@ def _build_daily_from_records(records: list, daily_path: str) -> pd.DataFrame:
 
 def fetch_gdelt_sentiment(ticker: str, company_name: str) -> pd.DataFrame:
     """
-    Orchestrate GDELT sentiment pipeline with three-level caching.
+    Two-level caching — no hash cache needed.
 
-    Level 1 — Daily CSV completeness check:
-        If daily CSV exists and covers full training window,
-        return immediately — no API calls, no FinBERT loading.
-        This is the common case on repeated pipeline runs.
-
-    Level 2 — Monthly chunk cache:
-        Tracks which months have already been fetched and scored.
-        Skips completed months — only processes new months.
-        FinBERT loads lazily — only initializes if scoring is needed.
-
-    Level 3 — Headline hash cache:
-        Within a month, if the exact same headlines were already
-        scored in a previous run, returns cached scores without
-        calling FinBERT at all.
-
-    Delete data/{ticker}_gdelt_daily.csv to force full refetch.
-    Delete data/{ticker}_gdelt_monthly_cache.csv to force re-scoring.
+    Level 1: daily CSV complete → return immediately, zero compute
+    Level 2: monthly cache → skip completed months
+    FinBERT only loads if genuinely uncached months exist.
     """
     import json
-    import hashlib
 
-    daily_path  = data_path(f"{ticker}_gdelt_daily.csv")
-    cache_path  = data_path(f"{ticker}_gdelt_monthly_cache.csv")
-    hash_path   = data_path(f"{ticker}_score_hashes.json")
+    daily_path = data_path(f"{ticker}_gdelt_daily.csv")
+    cache_path = data_path(f"{ticker}_gdelt_monthly_cache.csv")
 
-    # ── Level 1: Full cache check ─────────────────────────────────────
+    # ── Level 1: Complete cache check ────────────────────────────────
     if is_gdelt_cache_complete(ticker):
         cached = pd.read_csv(daily_path, index_col=0, parse_dates=True)
-        print(f"  Cache complete — skipping FinBERT ({len(cached)} rows)")
+        print(f"  Cache complete — skipping ({len(cached)} rows)")
         return cached
-    
-    # ── Pre-check: how many months need scoring? ──────────────────────
-    # This runs BEFORE loading FinBERT — only load if work is needed
-    cached_months = set()
-    if os.path.exists(cache_path):
-        cached_df     = pd.read_csv(cache_path, parse_dates=["date"])
-        cached_months = set(
-            pd.to_datetime(cached_df["date"]).dt.to_period("M").astype(str)
-        )
 
-        # Generate all months in training window
-    train_end = get_train_end(ticker)
-    start_dt  = datetime.strptime(TRAIN_START, "%Y-%m-%d")
-    end_dt    = datetime.strptime(train_end, "%Y-%m-%d")
-    all_months = set()
-    current    = start_dt
-    while current <= end_dt:
-        all_months.add(
-            current.to_period("M").strftime("%Y-%m")
-            if hasattr(current, "to_period")
-            else pd.Period(current, "M").strftime("%Y-%m")
-        )
-        next_month = (current.replace(day=28) + timedelta(days=4)).replace(day=1)
-        current    = next_month
-
-    months_needed = all_months - cached_months
-
-    if not months_needed:
-        # All months cached — rebuild daily CSV from monthly cache and return
-        print("  All months cached — rebuilding daily CSV without FinBERT...")
-        cached_df    = pd.read_csv(cache_path, parse_dates=["date"])
-        cached_records = cached_df.to_dict("records")
-        return _build_daily_from_records(cached_records, daily_path)
-
-    print(f"  {len(months_needed)} months need scoring — loading FinBERT...")
-
-    # ── Load monthly cache ────────────────────────────────────────────
+    # ── Level 2: Monthly cache — check before loading FinBERT ────────
     cached_records = []
     cached_months  = set()
 
@@ -624,24 +573,13 @@ def fetch_gdelt_sentiment(ticker: str, company_name: str) -> pd.DataFrame:
             pd.to_datetime(cached_df["date"]).dt.to_period("M").astype(str)
         )
 
-    # ── Load hash cache ───────────────────────────────────────────────
-    hash_cache = {}
-    if os.path.exists(hash_path):
-        with open(hash_path) as f:
-            try:
-                hash_cache = json.load(f)
-            except Exception:
-                hash_cache = {}
-
-    # ── Generate monthly chunks ───────────────────────────────────────
-    queries   = get_gdelt_queries(ticker, company_name)
+    # Generate all months in training window
     train_end = get_train_end(ticker)
+    start_dt  = datetime.strptime(TRAIN_START, "%Y-%m-%d")
+    end_dt    = datetime.strptime(train_end, "%Y-%m-%d")
 
-    start_dt = datetime.strptime(TRAIN_START, "%Y-%m-%d")
-    end_dt   = datetime.strptime(train_end, "%Y-%m-%d")
-    months   = []
-    current  = start_dt
-
+    months  = []
+    current = start_dt
     while current <= end_dt:
         next_month = (current.replace(day=28) + timedelta(days=4)).replace(day=1)
         months.append((
@@ -650,69 +588,32 @@ def fetch_gdelt_sentiment(ticker: str, company_name: str) -> pd.DataFrame:
         ))
         current = next_month
 
-    # ── Level 2 + 3: Process uncached months ─────────────────────────
-    new_records   = []
-    months_scored = 0
+    months_needed = [
+        (s, e) for s, e in months
+        if pd.to_datetime(s).to_period("M").strftime("%Y-%m") not in cached_months
+    ]
 
-    for month_start, month_end in months:
+    # ── Only load FinBERT if work actually needed ─────────────────────
+    if not months_needed:
+        print(f"  All months cached — rebuilding daily CSV...")
+        return _build_daily_from_records(cached_records, daily_path)
+
+    print(f"  {len(months_needed)} months need scoring...")
+    # FinBERT loads here — only if months_needed is non-empty
+    queries     = get_gdelt_queries(ticker, company_name)
+    new_records = []
+
+    for month_start, month_end in months_needed:
         period_key = pd.to_datetime(month_start).to_period("M").strftime("%Y-%m")
-
-        if period_key in cached_months:
-            continue   # Level 2 — skip completed month
-
         print(f"    {period_key}...", end=" ", flush=True)
 
-        company_series = pd.Series(dtype=float)
-        sector_series  = pd.Series(dtype=float)
+        company_series = fetch_gdelt_layer(
+            queries.get("company", []), month_start, month_end, "company"
+        )
+        sector_series = fetch_gdelt_layer(
+            queries.get("sector", []), month_start, month_end, "sector"
+        )
 
-        for layer_name, layer_queries in [
-            ("company", queries.get("company", [])),
-            ("sector",  queries.get("sector", []))
-        ]:
-            layer_scores = []
-
-            for query in layer_queries:
-                headlines = fetch_gdelt_artlist(query, month_start, month_end)
-
-                if headlines:
-                    # Level 3 — check headline hash cache
-                    content    = "|".join(sorted(h["headline"] for h in headlines))
-                    hl_hash    = hashlib.md5(content.encode()).hexdigest()
-                    cache_key  = f"{ticker}_{period_key}_{layer_name}_{hl_hash}"
-
-                    if cache_key in hash_cache:
-                        scored = hash_cache[cache_key]
-                    else:
-                        # FinBERT loads lazily here — only when actually needed
-                        scored = score_with_finbert(headlines)
-                        hash_cache[cache_key] = scored
-
-                    records_df = pd.DataFrame([
-                        {"date": h["date"], "score": h["score"]}
-                        for h in scored
-                    ])
-                    if not records_df.empty:
-                        records_df["date"] = pd.to_datetime(records_df["date"])
-                        series = records_df.groupby("date")["score"].mean()
-                        series.index = series.index.tz_localize(None)
-                        layer_scores.append(series)
-
-                else:
-                    # Fallback to timelinetone
-                    tone = fetch_gdelt_timelinetone(query, month_start, month_end)
-                    if not tone.empty:
-                        layer_scores.append(tone / 10.0)
-
-                time.sleep(0.5)
-
-            if layer_scores:
-                combined = pd.concat(layer_scores, axis=1).mean(axis=1)
-                if layer_name == "company":
-                    company_series = combined
-                else:
-                    sector_series  = combined
-
-        # Collect dates from both layers
         all_dates = set()
         if not company_series.empty:
             all_dates.update(company_series.index.tolist())
@@ -726,47 +627,15 @@ def fetch_gdelt_sentiment(ticker: str, company_name: str) -> pd.DataFrame:
                 "sector_tone":  float(sector_series.get(date, np.nan)),
             })
 
-        months_scored += 1
         print("done")
 
-    # ── Persist hash cache ────────────────────────────────────────────
-    if months_scored > 0:
-        with open(hash_path, "w") as f:
-            json.dump(hash_cache, f)
-
-    # ── Build final daily CSV ─────────────────────────────────────────
+    # Save updated monthly cache
     all_records = cached_records + new_records
-
-    if not all_records:
-        print(f"  No GDELT data for {ticker}")
-        return pd.DataFrame()
-
-    cache_df = pd.DataFrame(all_records)
+    cache_df    = pd.DataFrame(all_records)
     cache_df["date"] = pd.to_datetime(cache_df["date"])
     cache_df.to_csv(cache_path, index=False)
 
-    daily = cache_df.set_index("date").sort_index()
-    daily.index = daily.index.tz_localize(None)
-    daily = daily.groupby(daily.index).mean()
-
-    company_features = compute_layer_features(
-        daily["company_tone"].dropna(), "company"
-    )
-    sector_features = compute_layer_features(
-        daily["sector_tone"].dropna(), "sector"
-    )
-
-    result = company_features.join(sector_features, how="outer")
-    result["gdelt_composite"] = (
-        result["company_tone"].fillna(0) * GDELT_COMPANY_WEIGHT +
-        result["sector_tone"].fillna(0) * GDELT_SECTOR_WEIGHT
-    )
-
-    result.to_csv(daily_path)
-    print(f"  Saved {len(result)} rows → {daily_path}")
-    return result
-
-
+    return _build_daily_from_records(all_records, daily_path)
 
 # ── INSIDER TRANSACTIONS ──────────────────────────────────────────────
 
