@@ -1074,13 +1074,13 @@ def run_data_pipeline(tickers: list = None) -> None:
 
 if __name__ == "__main__":
     # Delete old GDELT daily CSVs — new pipeline produces different columns
-    for ticker in PRETRAINED_TICKERS:
+    '''for ticker in PRETRAINED_TICKERS:
         old_daily = data_path(f"{ticker}_gdelt_daily.csv")
         old_cache = data_path(f"{ticker}_gdelt_monthly_cache.csv")
         old_raw   = data_path(f"{ticker}_gdelt_raw.csv")
         for path in [old_daily, old_cache, old_raw]:
             if os.path.exists(path):
                 os.remove(path)
-                print(f"Cleared old cache: {path}")
+                print(f"Cleared old cache: {path}")'''
 
     run_data_pipeline()

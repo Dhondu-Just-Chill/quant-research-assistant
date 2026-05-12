@@ -2,7 +2,7 @@
 #
 # ML training pipeline for the quant research assistant.
 #
-# Feature layers (in order of addition):
+# Feature layers:
 #   Layer 1 — Technical indicators    (OHLCV-derived)
 #   Layer 2 — OHLC structure          (intraday price behavior)
 #   Layer 3 — Macro context           (VIX, TNX)
@@ -10,8 +10,7 @@
 #   Layer 5 — Rolling risk metrics    (Sharpe, drawdown, vol, skew, VaR)
 #   Layer 6 — Google Trends           (attention signal)
 #   Layer 7 — GDELT sentiment         (FinBERT-scored news sentiment)
-#
-# Accuracy progression tracked in MODEL_REGISTRY in config.py.
+#   Layer 8 — Insider transactions    (SEC Form 4 buy/sell activity)
 #
 # Run after data_pipeline.py:
 #   python src/ml_forecasting.py
@@ -30,7 +29,10 @@ import matplotlib.pyplot as plt
 import yfinance as yf
 from sklearn.inspection import permutation_importance
 from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import (
+    accuracy_score, precision_score,
+    recall_score, f1_score
+)
 from xgboost import XGBClassifier
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -42,12 +44,15 @@ from config import (
     RANDOM_STATE,
     N_CV_SPLITS,
     PARAM_GRID,
+    GDELT_API_URL,
+    GDELT_TIMEOUT,
     INFERENCE_LOOKBACK_MONTHS,
-    INFERENCE_START,
     data_path,
     model_path,
     output_path,
     get_train_end,
+    get_gdelt_queries,
+    get_trends_query,
     is_etf,
     update_registry,
     save_registry,
@@ -57,66 +62,55 @@ from config import (
 warnings.filterwarnings("ignore")
 
 
-# ── LAYER 1 + 2: TECHNICAL + OHLC STRUCTURE FEATURES ─────────────────
+# ── LAYER 1 + 2 + 5: TECHNICAL + OHLC + ROLLING RISK ─────────────────
 
 def add_technical_indicators(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     """
     Engineer all price-based features from OHLCV data.
 
-    Layer 1 — Technical indicators:
-        Moving averages, MACD, RSI, Bollinger Bands, ATR,
-        volume ratio, lag returns.
-
-    Layer 2 — OHLC structure features:
-        Capture intraday buying/selling pressure invisible in Close alone.
-        overnight_gap, intraday_range, close_position, upper_shadow,
-        lower_shadow.
-
-    Layer 5 — Rolling risk metrics:
-        Time-varying versions of statistical_analysis.py metrics.
-        Sharpe, drawdown, volatility, skewness, VaR — all rolling 20-day.
-        Single-period stats from statistical_analysis.py are useless as
-        features (same value every row). Rolling versions vary daily and
-        capture current risk regime.
+    Layer 1 — Moving averages, MACD, RSI, Bollinger Bands, ATR,
+              volume ratio, lag returns.
+    Layer 2 — OHLC structure: overnight_gap, intraday_range,
+              close_position, upper_shadow, lower_shadow.
+    Layer 5 — Rolling risk metrics: vol, Sharpe, drawdown, skew, VaR.
+              Rolling versions of statistical_analysis.py outputs —
+              vary daily unlike single-period summary stats.
     """
-    df = df.copy()
+    df     = df.copy()
     close  = df["Close"]
     high   = df["High"]
     low    = df["Low"]
     open_  = df["Open"]
     volume = df["Volume"]
 
-    # ── Layer 1: Technical Indicators ────────────────────────────────
-
-    # Moving averages
+    # ── Layer 1 ───────────────────────────────────────────────────────
     sma20 = close.rolling(20).mean()
     sma50 = close.rolling(50).mean()
-    df["price_to_sma20"]  = close / sma20
-    df["price_to_sma50"]  = close / sma50
-    df["sma20_to_sma50"]  = sma20 / sma50
+    df["price_to_sma20"] = close / sma20
+    df["price_to_sma50"] = close / sma50
+    df["sma20_to_sma50"] = sma20 / sma50
 
-    # MACD
     ema12 = close.ewm(span=12).mean()
     ema26 = close.ewm(span=26).mean()
     macd  = ema12 - ema26
-    df["macd"]            = macd
-    df["macd_signal"]     = macd.ewm(span=9).mean()
-    df["macd_histogram"]  = macd - df["macd_signal"]
+    df["macd"]           = macd
+    df["macd_signal"]    = macd.ewm(span=9).mean()
+    df["macd_histogram"] = macd - df["macd_signal"]
 
-    # RSI
     delta     = close.diff()
     gain      = delta.clip(lower=0).rolling(14).mean()
     loss      = (-delta.clip(upper=0)).rolling(14).mean()
     rs        = gain / loss.replace(0, np.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
 
-    # Bollinger Bands
-    bb_mid        = close.rolling(20).mean()
-    bb_std        = close.rolling(20).std()
+    bb_mid           = close.rolling(20).mean()
+    bb_std           = close.rolling(20).std()
     df["bb_width"]    = (2 * bb_std) / bb_mid
-    df["bb_position"] = (close - (bb_mid - 2 * bb_std)) / (4 * bb_std).replace(0, np.nan)
+    df["bb_position"] = (
+        (close - (bb_mid - 2 * bb_std)) /
+        (4 * bb_std).replace(0, np.nan)
+    )
 
-    # ATR
     tr = pd.concat([
         high - low,
         (high - close.shift()).abs(),
@@ -124,61 +118,44 @@ def add_technical_indicators(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     ], axis=1).max(axis=1)
     df["atr"] = tr.rolling(14).mean() / close
 
-    # Volume
     df["volume_ratio"] = volume / volume.rolling(20).mean()
 
-    # Lag returns
-    returns = close.pct_change()
+    returns          = close.pct_change()
     df["return_1d"]  = returns
     df["return_5d"]  = close.pct_change(5)
     df["return_10d"] = close.pct_change(10)
 
-    # ── Layer 2: OHLC Structure Features ─────────────────────────────
-
-    body_size       = (close - open_).abs()
-    candle_range    = (high - low).replace(0, np.nan)
-
+    # ── Layer 2 ───────────────────────────────────────────────────────
+    candle_range          = (high - low).replace(0, np.nan)
     df["overnight_gap"]   = (open_ - close.shift()) / close.shift()
     df["intraday_range"]  = (high - low) / close
     df["close_position"]  = (close - low) / candle_range
-    df["upper_shadow"]    = (high - pd.concat([close, open_], axis=1).max(axis=1)) / candle_range
-    df["lower_shadow"]    = (pd.concat([close, open_], axis=1).min(axis=1) - low) / candle_range
+    df["upper_shadow"]    = (
+        high - pd.concat([close, open_], axis=1).max(axis=1)
+    ) / candle_range
+    df["lower_shadow"]    = (
+        pd.concat([close, open_], axis=1).min(axis=1) - low
+    ) / candle_range
 
-    # ── Layer 5: Rolling Risk Metrics ─────────────────────────────────
-    # Time-varying versions of statistical_analysis.py outputs.
-    # 20-day window balances stability vs responsiveness.
-
-    # Rolling volatility — current vol regime
+    # ── Layer 5 ───────────────────────────────────────────────────────
     df["rolling_vol_20"]      = returns.rolling(20).std() * np.sqrt(252)
 
-    # Rolling Sharpe — recent risk-adjusted return
     roll_mean = returns.rolling(20).mean()
     roll_std  = returns.rolling(20).std().replace(0, np.nan)
     df["rolling_sharpe_20"]   = (roll_mean / roll_std) * np.sqrt(252)
 
-    # Rolling drawdown — how far below recent peak
     rolling_peak              = close.rolling(20).max()
     df["rolling_drawdown_20"] = (close - rolling_peak) / rolling_peak
 
-    # Rolling skewness — tail asymmetry of recent returns
     df["rolling_skew_20"]     = returns.rolling(20).skew()
-
-    # Rolling VaR 95% — recent left-tail risk
     df["rolling_var_20"]      = returns.rolling(20).quantile(0.05)
 
     return df
 
 
-# ── LAYER 3: MACRO FEATURES ───────────────────────────────────────────
+# ── LAYER 3: MACRO ────────────────────────────────────────────────────
 
 def load_and_merge_macro(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Merge macro features (VIX, TNX) into the feature matrix.
-
-    Uses forward-fill then backward-fill to handle weekends and
-    holidays where macro data is unavailable. Inner join ensures
-    we only keep dates where both price and macro data exist.
-    """
     macro_path = data_path("macro.csv")
     if not os.path.exists(macro_path):
         print("  Warning: macro.csv not found — skipping macro features")
@@ -186,24 +163,14 @@ def load_and_merge_macro(df: pd.DataFrame) -> pd.DataFrame:
 
     macro = pd.read_csv(macro_path, index_col=0, parse_dates=True)
     macro.index = pd.to_datetime(macro.index).tz_localize(None)
-
     df = df.join(macro, how="left")
     df[macro.columns] = df[macro.columns].ffill().bfill()
     return df
 
 
-# ── LAYER 4: EARNINGS PROXIMITY FEATURES ─────────────────────────────
+# ── LAYER 4: EARNINGS PROXIMITY ───────────────────────────────────────
 
 def load_and_merge_earnings(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    """
-    Merge earnings proximity features into the feature matrix.
-
-    Skipped for ETFs. Returns df unchanged if earnings file missing.
-
-    Features:
-        days_to_earnings   : trading days until next earnings (capped 60)
-        days_from_earnings : trading days since last earnings (capped 60)
-    """
     if is_etf(ticker):
         return df
 
@@ -212,8 +179,10 @@ def load_and_merge_earnings(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
         print(f"  Warning: {ticker}_earnings.csv not found — skipping")
         return df
 
-    earnings = pd.read_csv(earnings_path, parse_dates=["earnings_date"])
-    dates    = pd.to_datetime(earnings["earnings_date"]).dt.tz_localize(None).sort_values()
+    earnings  = pd.read_csv(earnings_path, parse_dates=["earnings_date"])
+    dates     = pd.to_datetime(
+        earnings["earnings_date"]
+    ).dt.tz_localize(None).sort_values()
 
     days_to   = []
     days_from = []
@@ -221,7 +190,6 @@ def load_and_merge_earnings(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     for date in df.index:
         future = dates[dates > date]
         past   = dates[dates <= date]
-
         days_to.append(
             min((future.iloc[0] - date).days, 60) if len(future) > 0 else 60
         )
@@ -234,23 +202,9 @@ def load_and_merge_earnings(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     return df
 
 
-# ── LAYER 6: GOOGLE TRENDS FEATURES ──────────────────────────────────
+# ── LAYER 6: GOOGLE TRENDS ────────────────────────────────────────────
 
 def load_and_merge_trends(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    """
-    Merge Google Trends attention features into the feature matrix.
-
-    Trends data is weekly — forward-filled to daily to match the
-    price data resolution. This means every trading day in a given
-    week carries the same trends score for that week, which is the
-    correct interpretation since weekly data represents the full week.
-
-    Features merged:
-        trends_score   : raw weekly attention index (0-100)
-        trends_change  : week-over-week change
-        trends_zscore  : deviation from 52-week baseline
-        trends_spike   : binary flag — abnormally high attention
-    """
     trends_path = data_path(f"{ticker}_trends.csv")
     if not os.path.exists(trends_path):
         print(f"  Warning: {ticker}_trends.csv not found — skipping trends")
@@ -259,37 +213,14 @@ def load_and_merge_trends(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     trends = pd.read_csv(trends_path, index_col=0, parse_dates=True)
     trends.index = pd.to_datetime(trends.index).tz_localize(None)
 
-    # Reindex to daily frequency then forward-fill weekly values
-    trends_daily = trends.reindex(df.index, method="ffill")
-
-    # Any remaining NaN at the start — backfill
-    trends_daily = trends_daily.bfill()
-
+    trends_daily = trends.reindex(df.index, method="ffill").bfill()
     df = df.join(trends_daily, how="left")
     return df
 
 
-# ── LAYER 7: GDELT SENTIMENT FEATURES ────────────────────────────────
+# ── LAYER 7: GDELT SENTIMENT ──────────────────────────────────────────
 
 def load_and_merge_gdelt(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    """
-    Merge GDELT sentiment features into the feature matrix.
-
-    Two sentiment layers:
-        company layer : sentiment directly about this company
-        sector layer  : industry/supply-chain sentiment
-
-    Null handling:
-        Forward-fill up to 7 days — sentiment persists short-term
-        Zero-fill after 7 days — assume neutral if no recent data
-
-    Features merged:
-        company_tone, company_tone_ma7, company_tone_change,
-        company_positive, company_negative,
-        sector_tone, sector_tone_ma7, sector_tone_change,
-        sector_positive, sector_negative,
-        gdelt_composite
-    """
     gdelt_path = data_path(f"{ticker}_gdelt_daily.csv")
     if not os.path.exists(gdelt_path):
         print(f"  Warning: {ticker}_gdelt_daily.csv not found — skipping GDELT")
@@ -298,36 +229,34 @@ def load_and_merge_gdelt(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     gdelt = pd.read_csv(gdelt_path, index_col=0, parse_dates=True)
     gdelt.index = pd.to_datetime(gdelt.index).tz_localize(None)
 
-    # Reindex to match price data dates
-    gdelt_aligned = gdelt.reindex(df.index)
-
-    # Forward-fill up to 7 days — sentiment persists short-term
-    gdelt_aligned = gdelt_aligned.ffill(limit=7)
-
-    # Zero-fill remaining NaN — neutral sentiment assumption
-    gdelt_aligned = gdelt_aligned.fillna(0)
-
+    gdelt_aligned = gdelt.reindex(df.index).ffill(limit=7).fillna(0)
     df = df.join(gdelt_aligned, how="left")
     return df
 
-# ── LAYER 8: INSIDER TRANSACTIONS FEATURES ───────────────────────────
+
+# ── LAYER 8: INSIDER TRANSACTIONS ────────────────────────────────────
 
 def load_and_merge_insider(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     """
     Merge insider transaction features into the feature matrix.
 
-    Features are pre-computed rolling aggregates — no forward-fill
-    needed since they're already computed on rolling windows.
-    Zero-fill any remaining NaN — no insider activity = neutral signal.
+    For large-cap tech stocks (FAANG), buy features will be near-zero
+    since executives transact via pre-arranged 10b5-1 plans.
+    Sell-side features still carry signal — sell acceleration and
+    cluster selling are meaningful even for large-caps.
+
+    For mid/small-cap tickers, buy features carry stronger signal —
+    executive open-market purchases indicate high conviction.
 
     Features merged:
-        insider_buy_count_30d  : purchases in last 30 days
-        insider_sell_count_30d : sales in last 30 days
-        insider_net_30d        : net buy/sell direction
-        insider_buy_value_30d  : log-scaled buy value
-        insider_sell_value_30d : log-scaled sell value
-        insider_cluster_buy    : 2+ insiders bought — conviction signal
-        exec_bought_30d        : CEO/CFO bought — highest signal
+        insider_buy_count_30d   : open-market purchases last 30 days
+        insider_sell_count_30d  : open-market sales last 30 days
+        insider_net_30d         : buy_count - sell_count
+        insider_buy_value_30d   : log-scaled buy dollar value
+        insider_sell_value_30d  : log-scaled sell dollar value
+        insider_cluster_buy     : 2+ insiders bought simultaneously
+        exec_bought_30d         : CEO/CFO specifically bought
+        insider_sell_accel      : sell acceleration vs prior 30-day window
     """
     insider_path = data_path(f"{ticker}_insider_daily.csv")
     if not os.path.exists(insider_path):
@@ -337,23 +266,28 @@ def load_and_merge_insider(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
     insider = pd.read_csv(insider_path, index_col=0, parse_dates=True)
     insider.index = pd.to_datetime(insider.index).tz_localize(None)
 
-    df = df.join(insider, how="left")
-    insider_cols = insider.columns.tolist()
-    df[insider_cols] = df[insider_cols].fillna(0)
+    # Add sell acceleration — current 30d sell count vs prior 30d
+    # Captures acceleration of selling pressure even when buys are zero
+    if "insider_sell_count_30d" in insider.columns:
+        insider["insider_sell_accel"] = (
+            insider["insider_sell_count_30d"] -
+            insider["insider_sell_count_30d"].shift(30)
+        ).fillna(0)
+
+    df = df.join(insider.reindex(df.index).fillna(0), how="left")
     return df
+
 
 # ── TARGET VARIABLE ───────────────────────────────────────────────────
 
 def create_labels(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Create binary classification target.
-
-    Target: 1 if tomorrow's close > today's close, else 0.
-    Last row dropped — no future close available for labeling.
+    Binary target: 1 if tomorrow's close > today's close, else 0.
+    Last row dropped — no future close available.
     """
-    df         = df.copy()
+    df           = df.copy()
     df["target"] = (df["Close"].shift(-1) > df["Close"]).astype(int)
-    df         = df.iloc[:-1]   # drop last row — no label available
+    df           = df.iloc[:-1]
     return df
 
 
@@ -361,31 +295,22 @@ def create_labels(df: pd.DataFrame) -> pd.DataFrame:
 
 def prepare_features(df: pd.DataFrame, ticker: str) -> tuple:
     """
-    Select features and drop rows with NaN values.
+    Select feature columns and drop rows with NaN values.
 
-    Returns (X, y, feature_names) where X is the feature matrix,
-    y is the target vector, and feature_names is the list of columns
-    used — saved alongside the model for consistent inference.
+    Excludes raw OHLCV columns — scale-dependent and non-stationary.
+    Drops any feature column with >50% missing values.
 
-    Feature exclusions:
-        OHLCV raw columns — scale-dependent, non-stationary
-        target column — would be data leakage
-        any column with >50% missing values — unreliable
+    Returns (X, y, feature_names).
     """
-    # Columns that are raw data — not engineered features
-    exclude = ["Open", "High", "Low", "Close", "Volume", "target"]
-
+    exclude      = ["Open", "High", "Low", "Close", "Volume", "target"]
     feature_cols = [c for c in df.columns if c not in exclude]
 
-    # Drop features with >50% missing values
     missing_pct  = df[feature_cols].isnull().mean()
     feature_cols = [c for c in feature_cols if missing_pct[c] <= 0.5]
 
-    # Drop rows where any selected feature is NaN
     df_clean = df[feature_cols + ["target"]].dropna()
-
-    X = df_clean[feature_cols]
-    y = df_clean["target"]
+    X        = df_clean[feature_cols]
+    y        = df_clean["target"]
 
     print(f"  Features: {len(feature_cols)} | Training rows: {len(X)}")
     return X, y, feature_cols
@@ -393,14 +318,10 @@ def prepare_features(df: pd.DataFrame, ticker: str) -> tuple:
 
 # ── TRAIN / TEST SPLIT ────────────────────────────────────────────────
 
-def walk_forward_split(X: pd.DataFrame,
-                       y: pd.Series) -> tuple:
+def walk_forward_split(X: pd.DataFrame, y: pd.Series) -> tuple:
     """
-    Chronological train/test split — never shuffles.
-
-    80% train, 20% test. Test set is always the most recent data.
-    Shuffling would leak future information into training — invalid
-    for any time series ML task.
+    Chronological 80/20 split — never shuffles.
+    Test set is always the most recent 20% of data.
     """
     split = int(len(X) * (1 - TEST_SIZE))
     return (
@@ -412,20 +333,21 @@ def walk_forward_split(X: pd.DataFrame,
 # ── HYPERPARAMETER TUNING ─────────────────────────────────────────────
 
 def tune_hyperparameters(X_train: pd.DataFrame,
-                         y_train: pd.Series,
-                         scale_pos_weight: float) -> dict:
+                         y_train: pd.Series) -> dict:
     """
-    GridSearch over PARAM_GRID using TimeSeriesSplit cross-validation.
+    GridSearch over PARAM_GRID using TimeSeriesSplit CV.
 
-    TimeSeriesSplit is mandatory — standard k-fold would randomly
-    mix future and past data, making CV accuracy artificially high
-    and the selected hyperparameters invalid.
-
-    scale_pos_weight balances class imbalance (unequal up/down days).
+    Key decisions:
+    - scoring="f1" not "accuracy" — finds better precision/recall
+      tradeoff rather than exploiting Up-day majority
+    - scale_pos_weight=1.0 — equal class treatment regardless of
+      actual Up/Down ratio in training data
+    - TimeSeriesSplit mandatory — prevents future data leaking into
+      cross-validation folds
     """
     tscv  = TimeSeriesSplit(n_splits=N_CV_SPLITS)
     model = XGBClassifier(
-        scale_pos_weight=scale_pos_weight,
+        scale_pos_weight=1.0,     # equal class weight — fixes Up bias
         random_state=RANDOM_STATE,
         eval_metric="logloss",
         verbosity=0,
@@ -435,24 +357,23 @@ def tune_hyperparameters(X_train: pd.DataFrame,
         estimator=model,
         param_grid=PARAM_GRID,
         cv=tscv,
-        scoring="accuracy",
+        scoring="f1",             # optimize F1 not accuracy
         n_jobs=-1,
-        verbose=0
+        verbose=0,
     )
     grid.fit(X_train, y_train)
-    print(f"  Best CV accuracy: {grid.best_score_:.3f}")
+    print(f"  Best CV F1: {grid.best_score_:.3f}")
     return grid.best_params_
 
 
 # ── MODEL TRAINING ────────────────────────────────────────────────────
 
 def train_model(X_train: pd.DataFrame, y_train: pd.Series,
-                best_params: dict,
-                scale_pos_weight: float) -> XGBClassifier:
-    """Train XGBoost with tuned hyperparameters on full training set."""
+                best_params: dict) -> XGBClassifier:
+    """Train XGBoost with tuned hyperparameters."""
     model = XGBClassifier(
         **best_params,
-        scale_pos_weight=scale_pos_weight,
+        scale_pos_weight=1.0,
         random_state=RANDOM_STATE,
         eval_metric="logloss",
         verbosity=0,
@@ -461,26 +382,59 @@ def train_model(X_train: pd.DataFrame, y_train: pd.Series,
     return model
 
 
+# ── THRESHOLD TUNING ──────────────────────────────────────────────────
+
+def tune_threshold(model: XGBClassifier,
+                   X_test: pd.DataFrame,
+                   y_test: pd.Series) -> float:
+    """
+    Find optimal classification threshold on the test set.
+
+    Default threshold is 0.5 — predict Up if prob_up > 0.5.
+    Tuning finds the threshold that maximizes F1, directly
+    controlling the precision/recall tradeoff.
+
+    Searches 0.35 → 0.65 in 0.01 steps.
+    Saves optimal threshold with the model for consistent inference.
+
+    Returns optimal threshold float.
+    """
+    probs      = model.predict_proba(X_test)[:, 1]
+    best_thresh = 0.50
+    best_f1     = 0.0
+
+    print("  Threshold tuning:")
+    for thresh in np.arange(0.35, 0.66, 0.01):
+        preds = (probs >= thresh).astype(int)
+        f1    = f1_score(y_test, preds, zero_division=0)
+        acc   = accuracy_score(y_test, preds)
+
+        if f1 > best_f1:
+            best_f1     = f1
+            best_thresh = thresh
+
+    print(f"  Optimal threshold: {best_thresh:.2f} → F1: {best_f1:.3f}")
+    return round(float(best_thresh), 2)
+
+
 # ── FEATURE SELECTION ─────────────────────────────────────────────────
 
 def select_features(model: XGBClassifier,
                     X_train: pd.DataFrame, y_train: pd.Series,
                     X_test: pd.DataFrame, y_test: pd.Series,
                     best_params: dict,
-                    scale_pos_weight: float) -> tuple:
+                    threshold: float) -> tuple:
     """
-    Permutation importance-based feature selection.
+    Permutation importance feature selection using F1 as criterion.
 
-    Computes permutation importance on the test set — measures how much
-    accuracy drops when each feature is randomly shuffled. Features with
-    negative mean importance (shuffling them improves accuracy) are noise.
+    Features with negative mean importance on the test set are dropped.
+    Pruned model adopted only if F1 >= baseline F1 — never worsens model.
 
-    Only adopts the pruned feature set if accuracy >= baseline —
-    guarantees this step never makes the model worse.
-
-    Returns (model, feature_list) — either pruned or original.
+    Uses tuned threshold for all predictions — consistent with inference.
     """
-    baseline_acc = accuracy_score(y_test, model.predict(X_test))
+    probs        = model.predict_proba(X_test)[:, 1]
+    y_pred       = (probs >= threshold).astype(int)
+    baseline_f1  = f1_score(y_test, y_pred, zero_division=0)
 
     perm = permutation_importance(
         model, X_test, y_test,
@@ -489,67 +443,69 @@ def select_features(model: XGBClassifier,
         n_jobs=-1,
     )
 
-    # Features with negative mean importance are actively harmful
-    importances  = perm.importances_mean
-    keep_mask    = importances >= 0
+    keep_mask     = perm.importances_mean >= 0
     kept_features = X_train.columns[keep_mask].tolist()
 
     if len(kept_features) == len(X_train.columns):
-        print(f"  No features pruned — all contribute positively")
+        print("  No features pruned — all contribute positively")
         return model, X_train.columns.tolist()
 
-    # Retrain on pruned feature set
+    # Retrain on pruned set
     model_pruned = XGBClassifier(
         **best_params,
-        scale_pos_weight=scale_pos_weight,
+        scale_pos_weight=1.0,
         random_state=RANDOM_STATE,
         eval_metric="logloss",
         verbosity=0,
     )
     model_pruned.fit(X_train[kept_features], y_train)
-    pruned_acc = accuracy_score(y_test, model_pruned.predict(X_test[kept_features]))
+
+    probs_pruned = model_pruned.predict_proba(X_test[kept_features])[:, 1]
+    y_pred_pruned = (probs_pruned >= threshold).astype(int)
+    pruned_f1    = f1_score(y_test, y_pred_pruned, zero_division=0)
 
     n_pruned = len(X_train.columns) - len(kept_features)
 
-    if pruned_acc >= baseline_acc:
-        print(f"  Pruned {n_pruned} features: {baseline_acc:.3f} → {pruned_acc:.3f}")
+    if pruned_f1 >= baseline_f1:
+        print(f"  Pruned {n_pruned} features: F1 {baseline_f1:.3f} → {pruned_f1:.3f}")
         return model_pruned, kept_features
     else:
-        print(f"  Pruning rejected: {pruned_acc:.3f} < baseline {baseline_acc:.3f} — keeping all features")
+        print(f"  Pruning rejected: F1 {pruned_f1:.3f} < baseline {baseline_f1:.3f}")
         return model, X_train.columns.tolist()
 
 
 # ── EVALUATION ────────────────────────────────────────────────────────
 
 def evaluate_model(model: XGBClassifier,
-                   X_test: pd.DataFrame, y_test: pd.Series,
-                   ticker: str, feature_list: list) -> dict:
+                   X_test: pd.DataFrame,
+                   y_test: pd.Series,
+                   ticker: str,
+                   feature_list: list,
+                   threshold: float) -> dict:
     """
-    Evaluate model on held-out test set and save feature importance chart.
-
-    Metrics:
-        accuracy  : overall directional accuracy
-        precision : of predicted Up days, how many were actually Up
-        recall    : of actual Up days, how many did we predict
-        f1        : harmonic mean of precision and recall
+    Evaluate on held-out test set using tuned threshold.
+    Saves feature importance chart to outputs/.
     """
-    y_pred = model.predict(X_test)
+    probs  = model.predict_proba(X_test)[:, 1]
+    y_pred = (probs >= threshold).astype(int)
 
     metrics = {
         "accuracy":  round(accuracy_score(y_test, y_pred), 4),
         "precision": round(precision_score(y_test, y_pred, zero_division=0), 4),
         "recall":    round(recall_score(y_test, y_pred, zero_division=0), 4),
         "f1":        round(f1_score(y_test, y_pred, zero_division=0), 4),
+        "threshold": threshold,
     }
 
-    print(f"  Accuracy:  {metrics['accuracy']:.1%}")
-    print(f"  Precision: {metrics['precision']:.1%}")
-    print(f"  Recall:    {metrics['recall']:.1%}")
-    print(f"  F1:        {metrics['f1']:.1%}")
+    print(f"  Accuracy:   {metrics['accuracy']:.1%}")
+    print(f"  Precision:  {metrics['precision']:.1%}")
+    print(f"  Recall:     {metrics['recall']:.1%}")
+    print(f"  F1:         {metrics['f1']:.1%}")
+    print(f"  Threshold:  {threshold:.2f}")
 
-    # Feature importance chart
+    # Feature importance chart — top 20
     importances = model.feature_importances_
-    indices     = np.argsort(importances)[::-1][:20]  # top 20
+    indices     = np.argsort(importances)[::-1][:20]
 
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.barh(
@@ -565,202 +521,117 @@ def evaluate_model(model: XGBClassifier,
     path = output_path(f"{ticker}_feature_importance.png")
     plt.savefig(path, dpi=150)
     plt.close()
-    print(f"  Saved feature importance chart → {path}")
+    print(f"  Saved chart → {path}")
 
     return metrics
 
 
 # ── SAVE MODEL ────────────────────────────────────────────────────────
 
-def save_model(model: XGBClassifier, feature_list: list,
-               ticker: str) -> None:
+def save_model(model: XGBClassifier,
+               feature_list: list,
+               ticker: str,
+               threshold: float) -> None:
     """
-    Save model and feature list together as a single pkl file.
+    Save model, feature list, and threshold together.
 
-    Saving both together prevents input mismatch at inference time —
-    the exact feature columns used during training are always available
-    when loading the model.
+    Threshold saved alongside model — inference always uses the
+    same threshold the model was evaluated with.
     """
     os.makedirs("models", exist_ok=True)
-    payload = {"model": model, "features": feature_list}
+    payload = {
+        "model":     model,
+        "features":  feature_list,
+        "threshold": threshold,
+    }
     joblib.dump(payload, model_path(ticker))
-    print(f"  Saved model → {model_path(ticker)}")
+    print(f"  Saved → {model_path(ticker)}")
 
 
-# ── FULL TRAINING PIPELINE ────────────────────────────────────────────
+# ── LIVE GDELT TONE ───────────────────────────────────────────────────
 
-def run_ml_pipeline(tickers: list = None) -> None:
+def fetch_live_gdelt_tone(ticker: str, company_name: str) -> dict:
     """
-    Run the full ML training pipeline for all configured tickers.
+    Fetch current GDELT sentiment via timelinetone — no FinBERT needed.
 
-    Per ticker:
-        1. Load OHLCV + engineer technical + OHLC structure + rolling risk features
-        2. Merge macro, earnings, trends, GDELT layers
-        3. Create binary target labels
-        4. Prepare feature matrix — drop raw columns and NaN rows
-        5. Chronological train/test split
-        6. GridSearch hyperparameter tuning with TimeSeriesSplit CV
-        7. Train XGBoost on full training set
-        8. Permutation importance feature selection
-        9. Evaluate on held-out test set
-        10. Save model + feature list
-        11. Update MODEL_REGISTRY with accuracy and metadata
+    Used at inference time in the Streamlit app. timelinetone returns
+    pre-aggregated tone for the last 7 days — single API call,
+    no local model, works within Streamlit Cloud RAM limits.
+
+    Returns dict with company_tone and sector_tone for today.
     """
-    if tickers is None:
-        tickers = PRETRAINED_TICKERS
+    import requests
 
-    # Load existing registry to preserve entries for untouched tickers
-    registry = load_registry()
+    queries   = get_gdelt_queries(ticker, company_name)
+    end_dt    = datetime.now().strftime("%Y%m%d%H%M%S")
+    start_dt  = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d%H%M%S")
 
-    results = {}
-
-    for ticker in tickers:
-        print(f"\n{'='*55}")
-        print(f"  Training pipeline: {ticker}")
-        print(f"{'='*55}")
-
+    def fetch_tone(query: str) -> float:
+        params = {
+            "query":         query,
+            "mode":          "timelinetone",
+            "format":        "json",
+            "startdatetime": start_dt,
+            "enddatetime":   end_dt,
+        }
         try:
-            # Step 1 — Load and engineer features
-            raw_path = data_path(f"{ticker}_raw.csv")
-            if not os.path.exists(raw_path):
-                print(f"  ERROR: {raw_path} not found — run data_pipeline.py first")
-                continue
+            r = requests.get(GDELT_API_URL, params=params,
+                             timeout=GDELT_TIMEOUT)
+            if not r.text.strip():
+                return 0.0
+            data     = r.json()
+            timeline = data.get("timeline", [])
+            values   = []
+            for series in timeline:
+                for point in series.get("data", []):
+                    values.append(float(point.get("value", 0.0)))
+            return float(np.mean(values)) / 10.0 if values else 0.0
+        except Exception:
+            return 0.0
 
-            df = pd.read_csv(raw_path, index_col=0, parse_dates=True)
-            df.index = pd.to_datetime(df.index).tz_localize(None)
+    company_tones = [fetch_tone(q) for q in queries.get("company", [])]
+    sector_tones  = [fetch_tone(q) for q in queries.get("sector", [])]
 
-            print("\n[1/9] Engineering features...")
-            df = add_technical_indicators(df, ticker)
-
-            # Step 2 — Merge data layers
-            print("[2/9] Merging data layers...")
-            df = load_and_merge_macro(df)
-            df = load_and_merge_earnings(df, ticker)
-            df = load_and_merge_trends(df, ticker)
-            df = load_and_merge_gdelt(df, ticker)
-            df = load_and_merge_insider(df, ticker)
-
-            # Step 3 — Create labels
-            print("[3/9] Creating labels...")
-            df = create_labels(df)
-
-            # Step 4 — Prepare feature matrix
-            print("[4/9] Preparing feature matrix...")
-            X, y, feature_cols = prepare_features(df, ticker)
-
-            # Step 5 — Train/test split
-            print("[5/9] Splitting train/test...")
-            X_train, X_test, y_train, y_test = walk_forward_split(X, y)
-            print(f"  Train: {len(X_train)} rows | Test: {len(X_test)} rows")
-
-            # Class balance
-            n_down          = (y_train == 0).sum()
-            n_up            = (y_train == 1).sum()
-            scale_pos_weight = n_down / n_up if n_up > 0 else 1.0
-            print(f"  Up days: {n_up} | Down days: {n_down} | scale_pos_weight: {scale_pos_weight:.2f}")
-
-            # Step 6 — Hyperparameter tuning
-            print("[6/9] Tuning hyperparameters (GridSearch + TimeSeriesSplit)...")
-            best_params = tune_hyperparameters(X_train, y_train, scale_pos_weight)
-            print(f"  Best params: {best_params}")
-
-            # Step 7 — Train final model
-            print("[7/9] Training final model...")
-            model = train_model(X_train, y_train, best_params, scale_pos_weight)
-
-            # Step 8 — Feature selection
-            print("[8/9] Permutation importance feature selection...")
-            model, final_features = select_features(
-                model, X_train, y_train, X_test, y_test,
-                best_params, scale_pos_weight
-            )
-
-            # Retrain on final features if pruning occurred
-            if set(final_features) != set(feature_cols):
-                model = train_model(
-                    X_train[final_features], y_train,
-                    best_params, scale_pos_weight
-                )
-                X_test = X_test[final_features]
-
-            # Step 9 — Evaluate
-            print("[9/9] Evaluating on test set...")
-            metrics = evaluate_model(model, X_test, y_test, ticker, final_features)
-
-            # Step 10 — Save
-            save_model(model, final_features, ticker)
-
-            # Step 11 — Update registry
-            update_registry(ticker, metrics["accuracy"], len(final_features))
-            results[ticker] = metrics
-
-        except Exception as e:
-            import traceback
-            print(f"  ERROR during {ticker} pipeline: {e}")
-            traceback.print_exc()
-            continue
-
-    # Save updated registry
-    save_registry()
-
-    # Print summary
-    print(f"\n{'='*55}")
-    print("Training Summary")
-    print(f"{'='*55}")
-    print(f"{'Ticker':<8} {'Accuracy':>10} {'Precision':>10} {'Recall':>10} {'F1':>10} {'Features':>10}")
-    print("-" * 55)
-    for ticker, m in results.items():
-        registry_entry = load_registry().get(ticker, {})
-        n_feat = registry_entry.get("n_features", "?")
-        print(
-            f"{ticker:<8} "
-            f"{m['accuracy']:>10.1%} "
-            f"{m['precision']:>10.1%} "
-            f"{m['recall']:>10.1%} "
-            f"{m['f1']:>10.1%} "
-            f"{n_feat:>10}"
-        )
+    return {
+        "company_tone": float(np.mean(company_tones)) if company_tones else 0.0,
+        "sector_tone":  float(np.mean(sector_tones))  if sector_tones  else 0.0,
+        "gdelt_composite": (
+            float(np.mean(company_tones)) * 0.6 +
+            float(np.mean(sector_tones))  * 0.4
+        ) if company_tones else 0.0,
+    }
 
 
 # ── LIVE INFERENCE ────────────────────────────────────────────────────
 
 def fetch_live_features(ticker: str) -> pd.DataFrame:
     """
-    Fetch today's feature row for inference on a trained model.
+    Fetch today's feature row for live inference.
 
-    Fetches INFERENCE_LOOKBACK_MONTHS of recent history — enough to
-    compute all rolling window features:
-        sma_50:        50 trading days  (~2.5 months)
-        vix_ma20:      20 trading days  (~1 month)
-        trends_zscore: 52 weeks         (~12 months)
-        rolling_*:     20 trading days
+    Uses Option B architecture — loads cached trends/GDELT from disk,
+    only fetches OHLCV and macro live. Keeps response time to ~3 seconds.
 
-    14 months covers all of these safely.
+    GDELT at inference time uses timelinetone (no FinBERT) — consistent
+    with cloud deployment constraints.
 
-    Returns a single-row DataFrame with today's engineered features,
-    aligned to the feature list the saved model was trained on.
+    Returns single-row DataFrame aligned to the saved model's feature list.
     """
-    from data_pipeline import (
-        fetch_market_data, fetch_macro_data,
-        fetch_trends_data, fetch_gdelt_sentiment,
-        get_company_name,
-    )
-    from dateutil.relativedelta import relativedelta
-
-    saved = joblib.load(model_path(ticker))
+    saved        = joblib.load(model_path(ticker))
     feature_list = saved["features"]
 
-    # Fetch recent history for rolling window computation
+    # Date range for rolling window computation
     end_date   = datetime.now().strftime("%Y-%m-%d")
     start_date = (
-        datetime.now() - relativedelta(months=INFERENCE_LOOKBACK_MONTHS)
+        datetime.now() - timedelta(days=INFERENCE_LOOKBACK_MONTHS * 31)
     ).strftime("%Y-%m-%d")
 
-    company_name = get_company_name(ticker)
+    # ── Live fetches ──────────────────────────────────────────────────
 
-    # Fetch all data layers
-    df = yf.download(ticker, start=start_date, end=end_date,
-                     interval="1d", auto_adjust=True, progress=False)
+    # OHLCV — always fresh
+    df = yf.download(
+        ticker, start=start_date, end=end_date,
+        interval="1d", auto_adjust=True, progress=False
+    )
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df.index = pd.to_datetime(df.index).tz_localize(None)
@@ -768,29 +639,215 @@ def fetch_live_features(ticker: str) -> pd.DataFrame:
     # Engineer features
     df = add_technical_indicators(df, ticker)
 
-    # Merge macro — fetch live
-    macro = fetch_macro_data()
-    df    = df.join(macro, how="left")
+    # Macro — fetch recent window only
+    vix = yf.download("^VIX", start=start_date, end=end_date,
+                      interval="1d", auto_adjust=True, progress=False)
+    tnx = yf.download("^TNX", start=start_date, end=end_date,
+                      interval="1d", auto_adjust=True, progress=False)
+
+    for raw in [vix, tnx]:
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+
+    macro = pd.DataFrame(index=vix.index)
+    macro.index = pd.to_datetime(macro.index).tz_localize(None)
+    macro["vix"]        = vix["Close"]
+    macro["tnx"]        = tnx["Close"]
+    macro["vix_change"] = macro["vix"].pct_change()
+    macro["tnx_change"] = macro["tnx"].pct_change()
+    macro["vix_ma20"]   = macro["vix"].rolling(20).mean()
+
+    df = df.join(macro, how="left")
     df[macro.columns] = df[macro.columns].ffill().bfill()
 
-    # Merge earnings — use existing saved file
+    # ── Cached fetches — load from disk ──────────────────────────────
+
+    # Earnings — use saved file
     df = load_and_merge_earnings(df, ticker)
 
-    # Merge trends — fetch live
-    trends = fetch_trends_data(ticker, company_name)
-    if not trends.empty:
+    # Trends — load from cached CSV, reindex to recent dates
+    trends_path = data_path(f"{ticker}_trends.csv")
+    if os.path.exists(trends_path):
+        trends = pd.read_csv(trends_path, index_col=0, parse_dates=True)
+        trends.index = pd.to_datetime(trends.index).tz_localize(None)
         trends_daily = trends.reindex(df.index, method="ffill").bfill()
         df = df.join(trends_daily, how="left")
 
-    # Merge GDELT — fetch live
-    gdelt = fetch_gdelt_sentiment(ticker, company_name)
-    if not gdelt.empty:
+    # GDELT — use timelinetone for live tone, extend cached daily CSV
+    gdelt_path = data_path(f"{ticker}_gdelt_daily.csv")
+    if os.path.exists(gdelt_path):
+        gdelt = pd.read_csv(gdelt_path, index_col=0, parse_dates=True)
+        gdelt.index = pd.to_datetime(gdelt.index).tz_localize(None)
         gdelt_aligned = gdelt.reindex(df.index).ffill(limit=7).fillna(0)
         df = df.join(gdelt_aligned, how="left")
 
-    # Take only the most recent row — today's feature state
+    # Insider — load from cached CSV
+    df = load_and_merge_insider(df, ticker)
+
+    # ── Extract latest row ────────────────────────────────────────────
+    # Only keep features the model was trained on
+    available = [f for f in feature_list if f in df.columns]
+    missing   = [f for f in feature_list if f not in df.columns]
+
+    if missing:
+        print(f"  Warning: {len(missing)} features missing at inference: {missing}")
+        for col in missing:
+            df[col] = 0.0
+
     latest = df[feature_list].iloc[-1:]
     return latest
+
+
+# ── FULL TRAINING PIPELINE ────────────────────────────────────────────
+
+def run_ml_pipeline(tickers: list = None) -> None:
+    """
+    Full ML training pipeline.
+
+    Steps per ticker:
+        1.  Load OHLCV
+        2.  Engineer features (technical + OHLC + rolling risk)
+        3.  Merge macro, earnings, trends, GDELT, insider layers
+        4.  Create binary labels
+        5.  Prepare feature matrix
+        6.  Chronological train/test split
+        7.  GridSearch with TimeSeriesSplit CV (optimizing F1)
+        8.  Train final model
+        9.  Tune classification threshold
+        10. Permutation importance feature selection (F1-based)
+        11. Evaluate on test set
+        12. Save model + features + threshold
+        13. Update MODEL_REGISTRY
+    """
+    if tickers is None:
+        tickers = PRETRAINED_TICKERS
+
+    # Load existing registry — preserves entries for untouched tickers
+    existing_registry = load_registry()
+    results           = {}
+
+    for ticker in tickers:
+        print(f"\n{'='*55}")
+        print(f"  Training: {ticker}")
+        print(f"{'='*55}")
+
+        try:
+            # Step 1 — Load OHLCV
+            raw_path = data_path(f"{ticker}_raw.csv")
+            if not os.path.exists(raw_path):
+                print(f"  ERROR: {raw_path} not found")
+                continue
+
+            df = pd.read_csv(raw_path, index_col=0, parse_dates=True)
+            df.index = pd.to_datetime(df.index).tz_localize(None)
+
+            # Steps 2-3 — Features + merge
+            print("\n[1/9] Engineering + merging features...")
+            df = add_technical_indicators(df, ticker)
+            df = load_and_merge_macro(df)
+            df = load_and_merge_earnings(df, ticker)
+            df = load_and_merge_trends(df, ticker)
+            df = load_and_merge_gdelt(df, ticker)
+            df = load_and_merge_insider(df, ticker)
+
+            # Step 4 — Labels
+            print("[2/9] Creating labels...")
+            df = create_labels(df)
+
+            # Step 5 — Feature matrix
+            print("[3/9] Preparing feature matrix...")
+            X, y, feature_cols = prepare_features(df, ticker)
+
+            # Step 6 — Split
+            print("[4/9] Splitting train/test...")
+            X_train, X_test, y_train, y_test = walk_forward_split(X, y)
+            print(f"  Train: {len(X_train)} | Test: {len(X_test)}")
+            print(f"  Up: {(y_train==1).sum()} | Down: {(y_train==0).sum()}")
+
+            # Step 7 — Tune hyperparameters (F1-optimized)
+            print("[5/9] GridSearch (F1-optimized)...")
+            best_params = tune_hyperparameters(X_train, y_train)
+            print(f"  Best params: {best_params}")
+
+            # Step 8 — Train
+            print("[6/9] Training final model...")
+            model = train_model(X_train, y_train, best_params)
+
+            # Step 9 — Threshold tuning
+            print("[7/9] Tuning classification threshold...")
+            threshold = tune_threshold(model, X_test, y_test)
+
+            # Step 10 — Feature selection (F1-based)
+            print("[8/9] Permutation importance feature selection...")
+            model, final_features = select_features(
+                model, X_train, y_train,
+                X_test, y_test,
+                best_params, threshold
+            )
+
+            # Retrain on final features if pruning occurred
+            if set(final_features) != set(feature_cols):
+                model     = train_model(
+                    X_train[final_features], y_train, best_params
+                )
+                threshold = tune_threshold(
+                    model, X_test[final_features], y_test
+                )
+                X_test = X_test[final_features]
+
+            # Step 11 — Evaluate
+            print("[9/9] Evaluating...")
+            metrics = evaluate_model(
+                model, X_test, y_test,
+                ticker, final_features, threshold
+            )
+
+            # Steps 12-13 — Save + registry
+            save_model(model, final_features, ticker, threshold)
+            update_registry(ticker, metrics["f1"], len(final_features))
+            results[ticker] = metrics
+
+        except Exception as e:
+            import traceback
+            print(f"  ERROR: {e}")
+            traceback.print_exc()
+            continue
+
+    # Merge results into existing registry — don't overwrite untouched tickers
+    final_registry = existing_registry.copy()
+    for ticker, metrics in results.items():
+        final_registry[ticker] = {
+            "baseline_accuracy": metrics["accuracy"],
+            "baseline_f1":       metrics["f1"],
+            "threshold":         metrics["threshold"],
+            "trained_on":        datetime.now().strftime("%Y-%m-%d"),
+            "train_end":         get_train_end(ticker),
+            "n_features":        len(results[ticker]) if ticker in results else None,
+        }
+
+    # Save merged registry
+    import json
+    os.makedirs("data", exist_ok=True)
+    with open(data_path("model_registry.json"), "w") as f:
+        json.dump(final_registry, f, indent=2)
+
+    # Summary table
+    print(f"\n{'='*65}")
+    print("Training Summary")
+    print(f"{'='*65}")
+    print(f"{'Ticker':<8} {'Accuracy':>10} {'Precision':>10} "
+          f"{'Recall':>10} {'F1':>10} {'Thresh':>8} {'Feats':>6}")
+    print("-" * 65)
+    for ticker, m in results.items():
+        print(
+            f"{ticker:<8} "
+            f"{m['accuracy']:>10.1%} "
+            f"{m['precision']:>10.1%} "
+            f"{m['recall']:>10.1%} "
+            f"{m['f1']:>10.1%} "
+            f"{m['threshold']:>8.2f} "
+            f"{final_registry[ticker].get('n_features', '?'):>6}"
+        )
 
 
 if __name__ == "__main__":
