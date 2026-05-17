@@ -468,8 +468,8 @@ def select_features(model: XGBClassifier,
     )
 
     n_pruned = len(X_train.columns) - len(kept_features)
-
-    if pruned_acc >= baseline_acc:
+    MIN_IMPRV = 0.01  # Minimum accuracy improvement to justify pruning
+    if pruned_acc >= baseline_acc + MIN_IMPRV:
         print(f"  Pruned {n_pruned} features: {baseline_acc:.3f} → {pruned_acc:.3f}")
         return model_pruned, kept_features
     else:
@@ -757,7 +757,8 @@ def run_ml_pipeline(tickers: list = None) -> None:
 
             n_down           = (y_train == 0).sum()
             n_up             = (y_train == 1).sum()
-            scale_pos_weight = n_down / n_up if n_up > 0 else 1.0
+            #scale_pos_weight = n_down / n_up if n_up > 0 else 1.0
+            scale_pos_weight = 1.0  # No weighting — slight Up majority is natural in bull markets, and balanced_accuracy handles it
             print(
                 f"  Up: {n_up} | Down: {n_down} | "
                 f"scale_pos_weight: {scale_pos_weight:.2f}"
